@@ -1,0 +1,4 @@
+// 根构建文件：只声明 AGP，不 apply
+plugins {
+    id 'com.android.application' version '8.10.1' apply false
+}

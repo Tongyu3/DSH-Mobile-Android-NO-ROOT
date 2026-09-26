@@ -1,0 +1,38 @@
+MIT License
+
+Copyright (c) 2026 DSH Mobile Android contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+注意 / Note
+-----------
+
+上面这个 MIT 许可证**只覆盖本仓库自身的代码**（Kotlin/Java/JS/构建脚本等）。
+
+本 APK 里另外打包了几个第三方二进制（proot、libtalloc、libandroid-shmem 等），
+它们各有各的许可证，详见 `THIRD-PARTY.md`。
+
+其中 **proot 是 GPLv2**。本 App 与 proot 之间是"以独立进程 exec"的关系
+（类似 mere aggregation），并不链接在一起，因此本仓库的代码采用 MIT 是可行的；
+但**分发**本 APK 时必须同时满足 proot 的 GPLv2 要求（附许可证全文 + 提供源码），
+`LICENSES/GPL-2.0.txt` 与 `THIRD-PARTY.md` 就是为此准备的。
+
+这属于我的技术性理解，不构成法律意见。若要商用，请自行咨询律师。

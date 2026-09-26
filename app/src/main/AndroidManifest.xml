@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- 在应用自己的沙箱里下载 rootfs / Node，并让 DSH 访问 DeepSeek API -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 前台服务：让容器里的 dsh 进程在 App 退到后台后仍能存活 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!--
+      读写手机共享存储，让容器里的 DSH 能像文件管理器一样操作手机文件。
+      之所以可行：本 App 的 targetSdk = 28（为 W^X 豁免而选），
+      Android 11+ 对 targetSdk ≤ 29 的应用仍沿用**旧版存储模型**，
+      因此这两个权限即可获得共享存储的完整读写权限；
+      若 targetSdk ≥ 30 就只能走 SAF，做不到"文件管理器"级别的访问。
+      权限在运行时申请（Android 6+ 危险权限）。
+    -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <!-- DSH Web UI 走 http://127.0.0.1:<port>，需要允许明文回环流量 -->
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:requestLegacyExternalStorage="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 常驻服务：维持 dsh web 进程。targetSdk 28 故无需 foregroundServiceType。 -->
+        <service
+            android:name=".DshService"
+            android:exported="false" />
+
+        <!--
+          手机控制的无障碍服务。
+          注意：它不会修改系统任何东西 —— 只是请求用户在「设置 → 无障碍」里手动开启，
+          真正的授权边界是 App 内的应用白名单。
+        -->
+        <service
+            android:name=".DshAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 白名单配置界面 -->
+        <activity
+            android:name=".AppControlActivity"
+            android:exported="false"
+            android:label="📱 手机控制" />
+    </application>
+</manifest>

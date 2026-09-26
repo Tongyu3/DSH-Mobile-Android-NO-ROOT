@@ -1,0 +1,26 @@
+// DSH Mobile — Phase 0 探针工程
+//
+// 仓库顺序经过实测调整：
+//   最初把 Aliyun 镜像放最前，结果构建时 Aliyun 的 public 仓库拉不到
+//   netty 系列 jar，直接 BUILD FAILED。
+//   改为官方仓库优先（本机实测 dl.google.com 533ms、Maven Central 1.5s，
+//   都很快且稳定），Aliyun 仅作兜底。
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+    }
+}
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+    }
+}
+rootProject.name = "DshMobile"
+include(":app")

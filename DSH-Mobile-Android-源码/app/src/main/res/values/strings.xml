@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 应用在桌面与最近任务里显示的名字。
+         想换成别的（例如「DSH 手机版」）只改这一行即可，不影响包名，
+         因此不会导致容器里的 rootfs / Node / DSH 需要重装。 -->
+    <string name="app_name">DeepSeek Harness</string>
+
+    <string name="a11y_summary">让 DSH 操作你指定的应用</string>
+    <string name="a11y_desc">仅供 DeepSeek Harness 在你勾选的应用内执行点击、滑动与文字输入。白名单之外的应用一律拒绝，不会读取其界面内容。不涉及 root，也不修改系统任何设置，可随时关闭。</string>
+</resources>

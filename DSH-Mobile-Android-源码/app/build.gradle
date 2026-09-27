@@ -1,0 +1,140 @@
+// DSH Mobile —— 把 DSH 装进 APK
+//
+// 关键点（务必保留）：
+//   targetSdk 必须是 28 —— Android 10+ 的 W^X 策略禁止 targetSdk>=29 的应用
+//   执行自己数据目录里的文件。Termux 也是靠停在 28 才能跑 Linux 二进制。
+//   代价：不能上架 Google Play，只能侧载（本项目本来就只侧载）。
+//   compileSdk 用 36 没问题，targetSdk 可以低于 compileSdk。
+plugins {
+    id 'com.android.application'
+}
+
+// 发布签名：口令放在 keystore.properties（和 release.keystore 一起保管）。
+// 丢失 keystore = 无法再给已安装的用户发升级包（签名不匹配，只能卸载重装）。
+def keystorePropsFile = rootProject.file('keystore.properties')
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
+android {
+    namespace 'com.dshmobile.probe'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.dshmobile.probe"
+        minSdk 24
+        targetSdk 28          // ← 不许改大，见上方注释
+        versionCode 7
+        versionName "0.1.6"
+    }
+
+    signingConfigs {
+        release {
+            if (keystorePropsFile.exists()) {
+                storeFile rootProject.file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+            /*
+             * 三种签名方案全部打开。
+             *
+             * AGP 默认只签 v2 —— 理论上 minSdk 24（Android 7.0）用 v2 就够，
+             * 但分享出去后在别人手机上装不上。已知会导致"解析包出错 /
+             * 应用未安装"的原因里，v1 缺失是常见一条：
+             *   · 部分国产 ROM 的安装器 / 第三方文件管理器走的是 v1(JAR) 校验路径；
+             *   · Android 7.x 早期版本对"只签 v2"的包有过兼容问题；
+             *   · 一些加固/重签工具也只认 v1。
+             * v1 对现代设备完全无害（只多几十 KB），v3 则支持密钥轮换。
+             * 三个都开是 apksigner 官方推荐的最高兼容性组合。
+             */
+            enableV1Signing true
+            enableV2Signing true
+            enableV3Signing true
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+            /*
+             * 刻意让 debug 也用**发布签名**。
+             *
+             * 这样 debug / release 两个包装到同一台手机上可以互相覆盖安装，
+             * 不会因为签名不同而必须先卸载 —— 卸载会清掉 App 私有数据，
+             * 也就是容器里已经下好的 Ubuntu + Node + DSH（约 100MB）、
+             * API Key 和白名单。以后要排查界面问题（需要可调试版连 DevTools）
+             * 就不必再让用户重下一次容器。
+             */
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+        release {
+            /*
+             * 刻意**不**开启 R8/混淆。
+             *
+             * 这个 App 靠 WebView 里的 @JavascriptInterface（DshAndroid）与页面通信，
+             * 混淆有可能把被反射调用的方法改掉，导致注入的「API Key（本机）」
+             * 和「📱 手机控制（本机）」两个入口静默失效。
+             * 收益（体积）远小于风险，所以保持关闭。
+             */
+            minifyEnabled false
+            shrinkResources false
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        /*
+         * targetSdk 28 是**故意**的（Android 10+ 的 W^X 要求，见文件顶部注释），
+         * 而 ExpiredTargetSdkVersion 这条检查是给"上架 Google Play"用的。
+         * 我们只侧载，所以必须关掉它 —— 否则 release 构建会被 lintVitalRelease 直接中断。
+         */
+        disable 'ExpiredTargetSdkVersion'
+        abortOnError false
+    }
+}
+
+dependencies {
+    // rootfs 是 .tar.gz，Android 没有内置 tar 解包能力。
+    // 用 1.26.2：这个版本没有额外依赖（1.27+ 会强制依赖 commons-io）。
+    implementation 'org.apache.commons:commons-compress:1.26.2'
+}
+
+/*
+ * 前端补丁保持"单一事实来源"。
+ *
+ * `tools/patch.js` 是**源文件**，`app/src/main/assets/dsh-mobile.js` 是构建时
+ * 自动同步出来的副本（由 WebViewClient.onPageFinished 注入 DSH 页面）。
+ * 这样就不会出现"改了 patch.js 却忘了拷进 assets、打包出来还是旧行为"的事故
+ * —— 之前靠手动复制，确实踩过一次。
+ *
+ * 两个候选路径是为了兼容两种目录布局：
+ *   · 仓库布局：项目根 = 仓库根，tools/ 就在旁边
+ *   · 本地开发：tools/ 在项目根的上一级
+ */
+def resolvePatch() {
+    def candidates = [rootProject.file('tools/patch.js'), rootProject.file('../tools/patch.js')]
+    return candidates.find { it.exists() }
+}
+
+tasks.register('syncMobilePatch', Copy) {
+    def src = resolvePatch()
+    onlyIf { src != null }
+    if (src != null) {
+        from src
+        into layout.projectDirectory.dir('src/main/assets')
+        rename { 'dsh-mobile.js' }
+    }
+}
+
+tasks.named('preBuild') { dependsOn 'syncMobilePatch' }

@@ -848,14 +848,30 @@
     ensureStyle();
     var narrow = window.innerWidth < NARROW_PX;
     root.setAttribute('data-dsh-mobile', narrow ? '1' : '0');
-    if (!narrow) return;
 
+    /*
+     * 与宽度无关的修补 —— 平板（>= 700px）同样要生效。
+     *
+     * 以前这里是 `if (!narrow) return;`，等于把平板用户直接放过去了：
+     * 他们拿到的是一个"完全没打过补丁"的 DSH —— 回车会直接发送、
+     * 「添加工作区」对话框里没有手机目录快捷入口、落地页右上角还挂着一个
+     * 多余的侧边栏按钮。这三件事跟窄屏布局毫无关系，所以无条件执行。
+     */
     markLanding();
     patchComposerEnter();
+    patchWorkspacePicker();
+
+    /*
+     * 下面这些都是手机窄屏专属的布局修补，平板不能套用：
+     *   - patchSidebar / patchDrawerAutoClose：平板本来就是常驻侧边栏，没有抽屉
+     *   - patchQuestionCard：配套的 CSS 全部限定在 html[data-dsh-mobile="1"] 下
+     *   - 设置页的「返回 / 关闭」和 data-dsh-view 单栏切换：平板是双栏，不需要
+     */
+    if (!narrow) return;
+
     patchSidebar();
     patchDrawerAutoClose();
     patchQuestionCard();
-    patchWorkspacePicker();
 
     var dlg = settingsDialog();
     if (!dlg) {

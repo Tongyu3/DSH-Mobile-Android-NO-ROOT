@@ -18,6 +18,22 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
+    <!--
+      权限自愈：把「无障碍」开关被系统/厂商策略关掉之后自动写回去。
+
+      这个权限的 protectionLevel 是 signature|privileged|development，
+      普通应用装完拿不到，但**带 development 标志的权限可以用 pm grant 单独授予**：
+
+          adb shell pm grant com.dshmobile.probe android.permission.WRITE_SECURE_SETTINGS
+
+      关键点：pm grant 的结果是**持久化**的（写进 packages.xml，
+      重启、清后台都不会掉），所以只需要做一次。
+      这也正是"懒人版"的可行形态 —— 一次性动作，之后 App 自己搞定。
+
+      没有它的时候，App 依然能检测到无障碍被关，但只能弹窗让用户手动去开。
+    -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
     <!-- DSH Web UI 走 http://127.0.0.1:<port>，需要允许明文回环流量 -->
     <application
         android:label="@string/app_name"
@@ -65,5 +81,19 @@
             android:name=".AppControlActivity"
             android:exported="false"
             android:label="📱 手机控制" />
+
+        <!--
+          Shizuku 客户端必需的一环：Shizuku 通过这个 ContentProvider 把 binder 交给本应用。
+          android:permission=INTERACT_ACROSS_USERS_FULL 是为了**阻止普通应用**访问它 ——
+          这是 Shizuku 官方文档规定的写法，不是我们额外要的权限。
+          没有装 Shizuku 的手机上，这个 provider 就是静静地待着，不会报错。
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>

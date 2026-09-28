@@ -28,6 +28,37 @@ public final class Env {
     /** dsh web 的监听端口（回环）。 */
     public static final int DSH_PORT = 3080;
 
+    /**
+     * 实际使用的端口。默认 {@link #DSH_PORT}，但**被别的进程占用时会自动往后找一个**。
+     *
+     * 为什么需要：`dsh --port 3080` 在端口被占时起不来（EADDRINUSE），
+     * 而我们的监督循环会不停地重启、永远拿不到 URL ——
+     * 用户看到的就是"初始化失败 / 一直起不来"，且现象和别的原因长得一样。
+     * 3080 是个很容易撞车的端口，所以这里先自己探一遍。
+     */
+    private static volatile int sPort = DSH_PORT;
+
+    public static int port() { return sPort; }
+
+    public static void setPort(int p) { sPort = p; }
+
+    /** 从 from 开始找一个**能绑定**的回环端口；全被占就返回 from（让 dsh 自己报错）。 */
+    public static int pickFreePort(int from, int to) {
+        for (int p = from; p <= to; p++) {
+            java.net.ServerSocket ss = null;
+            try {
+                ss = new java.net.ServerSocket(p, 1,
+                        java.net.InetAddress.getByName("127.0.0.1"));
+                return p;
+            } catch (Throwable ignore) {
+                // 该端口被占用，试下一个
+            } finally {
+                try { if (ss != null) ss.close(); } catch (Throwable ignore) { }
+            }
+        }
+        return from;
+    }
+
     /** 手机共享存储在宿主机上的真实路径。 */
     public static final String SDCARD_HOST = "/storage/emulated/0";
     /** 共享存储挂进容器后使用的路径（和安卓习惯一致）。 */
@@ -277,7 +308,7 @@ public final class Env {
         a.add(nodePath + "/dsh");
         a.add("--profile"); a.add("web");
         a.add("--no-open");
-        a.add("--port"); a.add(String.valueOf(DSH_PORT));
+        a.add("--port"); a.add(String.valueOf(sPort));
         return a.toArray(new String[0]);
     }
 

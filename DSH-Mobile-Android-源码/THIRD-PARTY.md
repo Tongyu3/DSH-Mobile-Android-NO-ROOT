@@ -68,6 +68,27 @@ MIT 许可证全文见 [`LICENSES/MIT-libandroid-shmem.txt`](LICENSES/MIT-liband
 
 ---
 
+## 5. Shizuku API
+
+| 项目 | 内容 |
+|---|---|
+| 用途 | 让**没有电脑**的用户也能完成一次 `pm grant` 授权：Shizuku 以 shell 身份替本 App 执行命令 |
+| 版本 | `dev.rikka.shizuku:api:13.1.5` + `dev.rikka.shizuku:provider:13.1.5`（Maven Central） |
+| 许可证 | **Apache License 2.0** |
+| 许可证全文 | [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt) |
+| 版权 | Copyright Rikka 及 Shizuku 贡献者 |
+| 上游 | https://github.com/RikkaApps/Shizuku |
+| 修改 | **未修改**，以 Maven 依赖原样编译进 APK |
+
+> 注意区分两件事：
+> 1. **上表这两个库是编译进本 APK 的**（Apache-2.0，随包附带许可证全文即可）；
+> 2. **Shizuku 应用本身不在本 APK 里**。它由用户自行安装（我们的「分享包」里
+>    另外附带了一份官方 APK，同样附带许可证与来源说明，见 `分享/shizuku/`）。
+>
+> 本 App 只通过 Shizuku 执行一条 `pm grant` 命令，不依赖它的任何其它能力。
+
+---
+
 ## 不在 APK 里、但首次运行时会从官方源下载的组件
 
 这些**不随 APK 分发**，是用户设备上的包管理器/下载器从官方地址拉取的，

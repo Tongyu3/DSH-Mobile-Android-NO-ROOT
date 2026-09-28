@@ -62,6 +62,66 @@ public class DshService extends Service {
 
     public static boolean getNeedsProvision() { return sNeedsProvision; }
 
+    /** onCreate 是否跑过 —— 用来区分"服务根本没起来"和"起来了但 dsh 没就绪"。 */
+    private static volatile boolean sCreated = false;
+    public static boolean isCreated() { return sCreated; }
+
+    /**
+     * dsh 进程最近输出的若干行。
+     *
+     * 为什么必须留：原来这段输出**只看 URL、其余全部丢弃**，
+     * 于是 dsh 起不来的时候，用户和我们都拿不到任何原因 ——
+     * 只能看到"等待超时"。现在失败信息里会带上这几行。
+     */
+    private static final java.util.ArrayDeque<String> sRecent =
+            new java.util.ArrayDeque<>();
+    private static final int RECENT_MAX = 60;
+
+    public static String getRecentOutput() {
+        synchronized (sRecent) {
+            if (sRecent.isEmpty()) return "(dsh 没有任何输出)";
+            StringBuilder sb = new StringBuilder();
+            int skip = Math.max(0, sRecent.size() - 12);   // 只给最后 12 行
+            int i = 0;
+            for (String l : sRecent) {
+                if (i++ < skip) continue;
+                sb.append("      ").append(l).append('\n');
+            }
+            return sb.toString();
+        }
+    }
+
+    /**
+     * 记一条"非 dsh 进程"的事件到最近输出里（例如无障碍守护的自愈动作）。
+     *
+     * <p>放进同一个环形缓冲是为了让「复制日志」一次带走全部线索 ——
+     * 之前排查权限问题时，最需要的信息恰恰在 dsh 的输出之外。
+     */
+    public static void note(String line) {
+        if (line == null) return;
+        synchronized (sRecent) {
+            sRecent.addLast("[守护] " + line);
+            while (sRecent.size() > RECENT_MAX) sRecent.removeFirst();
+        }
+    }
+
+    /** 像报错的行（用于把关键输出写进报告）。 */
+    private static boolean looksLikeError(String line) {
+        String s = line.toLowerCase();
+        return s.contains("error") || s.contains("eacces") || s.contains("enoent")
+            || s.contains("eaddrinuse") || s.contains("cannot") || s.contains("cannot find")
+            || s.contains("throw") || s.contains("exception") || s.contains("failed")
+            || s.contains("listen") || s.contains("port");
+    }
+
+    /** 往报告文件追加（和 MainActivity 用同一个文件，方便「复制日志」一次带走）。 */
+    private void appendReport(String text) {
+        try (java.io.OutputStream os = new java.io.FileOutputStream(
+                new java.io.File(Env.base(this), "report.txt"), true)) {
+            os.write(text.getBytes(StandardCharsets.UTF_8));
+        } catch (Throwable ignore) { }
+    }
+
     /** 请求重启 dsh 进程（不重启 Service 本身，避免 stop/start 的时序问题）。 */
     public static void requestRestart() { sRestartRequested = true; }
 
@@ -91,10 +151,13 @@ public class DshService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        sCreated = true;
         createChannel();
         startForeground(NOTIF_ID, buildNotification("正在启动容器…"));
         new Thread(this::supervise, "dsh-supervisor").start();
         new Thread(this::watchRestart, "dsh-restart-watcher").start();
+        // 无障碍守护：厂商把无障碍开关关掉时自动写回去（需要一次性 WRITE_SECURE_SETTINGS 授权）
+        A11yGuard.start(this);
     }
 
     @Override
@@ -192,6 +255,19 @@ public class DshService extends Service {
                 return;
             }
             sNeedsProvision = false;
+            /*
+             * 先挑一个**没被占用**的端口。3080 很容易撞车，
+             * 而端口被占时 dsh 会直接起不来、监督循环无限重启 ——
+             * 用户看到的现象和"卡死"完全一样。
+             */
+            int port = Env.pickFreePort(Env.DSH_PORT, Env.DSH_PORT + 10);
+            Env.setPort(port);
+            if (port != Env.DSH_PORT) {
+                appendReport("  · 默认端口 " + Env.DSH_PORT + " 被占用，改用 " + port + "\n");
+                Log.w(TAG, "端口 " + Env.DSH_PORT + " 被占用，改用 " + port);
+            } else {
+                appendReport("  · 使用端口 127.0.0.1:" + port + "\n");
+            }
             setState("正在启动 dsh web…");
             updateNotification("正在启动 DSH…");
 
@@ -223,17 +299,36 @@ public class DshService extends Service {
                     ? "运行中（未设置 API Key）"
                     : "运行中（已设置 API Key）");
 
-            // 持续读取输出：解析带 token 的 URL
+            // 持续读取输出：解析带 token 的 URL，同时**保留最近若干行**用于诊断
             try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
+                int n = 0;
                 while ((line = br.readLine()) != null) {
+                    n++;
+                    synchronized (sRecent) {
+                        sRecent.addLast(line);
+                        while (sRecent.size() > RECENT_MAX) sRecent.removeFirst();
+                    }
+                    // 头几行 + 任何像报错的行都写进报告
+                    if (n <= 30 || looksLikeError(line)) {
+                        appendReport("    dsh| " + line + "\n");
+                    }
                     if (sUrl == null) {
-                        Matcher m = Pattern.compile("http://127\\.0\\.0\\.1:\\d+(?:/\\?[^\\s)]+)?")
+                        /*
+                         * 放宽 URL 匹配：不再死认 127.0.0.1。
+                         * dsh 若打印 localhost / 0.0.0.0 之类的地址，
+                         * 原来的正则匹配不到 —— 表现就是"永远等不到 URL"。
+                         * 这里统一归一化成 127.0.0.1 再交给 WebView。
+                         */
+                        Matcher m = Pattern.compile(
+                                "https?://(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|\\[::1\\]|\\[::\\]):(\\d+)(/[^\\s)]*)?")
                                 .matcher(line);
                         if (m.find()) {
-                            sUrl = m.group();
-                            setState("运行中 · 127.0.0.1:" + Env.DSH_PORT);
+                            String path = m.group(2) == null ? "" : m.group(2);
+                            sUrl = "http://127.0.0.1:" + m.group(1) + path;
+                            setState("运行中 · 127.0.0.1:" + m.group(1));
+                            appendReport("  dsh 就绪: " + sUrl + "\n");
                             Log.i(TAG, "就绪: " + sUrl);
                         }
                     }
@@ -241,6 +336,7 @@ public class DshService extends Service {
             }
             int code = p.waitFor();
             Log.w(TAG, "dsh 进程退出, code=" + code);
+            appendReport("  ❌ dsh 进程退出 code=" + code + "\n" + getRecentOutput());
             setState("进程已退出 (" + code + ")，将自动重启");
             updateNotification("DSH 已退出，正在重启…");
         } catch (Throwable t) {

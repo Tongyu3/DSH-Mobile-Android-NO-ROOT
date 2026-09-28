@@ -99,21 +99,42 @@ public class MainActivity extends Activity {
     private volatile String webViewVersion = "?";
 
     /*
-     * 对照实验用的"老 WebView 模拟器"：先删掉这些较新的全局对象，再看垫片能不能救回来。
+     * 对照实验用的"模拟老 WebView"删除器，**正式构建必须留空**。
      *
-     * 实测结论（本机 WebView 138 上跑）：
-     *   只注入删除器            → 复现朋友的报错 "Failed to load plugins"
-     *   删除器 + 垫片           → 页面完全正常，垫片补了 14 项
-     * 这同时证明了两件事：onPageStarted 的注入**确实早于** DSH 的插件脚本；
-     * 以及垫片确实能修好这个问题。
-     *
-     * 正式发布时必须保持为空字符串（正常运行时垫片是"零操作"）。
+     * 留空时 onPageStarted 只注入 webview-shim.js（兼容垫片）；
+     * 调试时把它填成删除 AbortSignal.any / structuredClone 之类的语句，
+     * 就能在最新版 WebView 上复现老机器的问题（见 0.1.9 的平板排查）。
      */
     private static final String SIMULATE_OLD_WEBVIEW = "";
 
     /** 短命令的默认超时。 */
     private static final long EXEC_TIMEOUT_MS = 120_000L;
     private static final long EXEC_IDLE_MS = 120_000L;
+    /** 流式命令保留的最后若干行（失败时展示给用户）。 */
+    private static final int EXEC_TAIL_MAX = 40;
+    /*
+     * 留空即正常使用（曾临时指向不可达地址以验证失败诊断链路）。
+     */
+    private static final String TEMP_BROKEN_REGISTRY = null;
+
+    private final java.util.ArrayDeque<String> sExecTail = new java.util.ArrayDeque<>();
+    /** 供失败提示使用：把 tail 拼成文本。 */
+    private String execTailText() {
+        synchronized (sExecTail) {
+            if (sExecTail.isEmpty()) return "    (没有任何输出)";
+            StringBuilder sb = new StringBuilder();
+            for (String l : sExecTail) sb.append("    | ").append(l).append('\n');
+            return sb.toString();
+        }
+    }
+    /** 命令输出里像报错的行（用于实时提示）。 */
+    private static boolean looksLikeErrorLine(String line) {
+        String s = line.toLowerCase();
+        return s.contains("npm err") || s.contains("error") || s.contains("eacces")
+            || s.contains("enoent") || s.contains("enospc") || s.contains("eaddrinuse")
+            || s.contains("cannot") || s.contains("exception") || s.contains("failed")
+            || s.contains("killed") || s.contains("out of memory") || s.contains("segmentation");
+    }
     /** 容器内 npm install：官方自己都说可能 5-15 分钟，给足但必须有上限。 */
     private static final long NPM_TIMEOUT_MS = 25 * 60_000L;
     private static final long NPM_IDLE_MS = 5 * 60_000L;
@@ -250,9 +271,22 @@ public class MainActivity extends Activity {
                  * 是否真的够早由 SIMULATE_OLD_WEBVIEW 的对照实验来验证
                  * （先删掉 Iterator 再看插件是否报错）。
                  */
+                /*
+                 * ⚠️ 曾经这里的注入语句在改动中被写成只注入 SIMULATE_OLD_WEBVIEW，
+                 * 把 webCompatShim 漏掉了 —— 垫片实际上从来没进过页面。
+                 * 老 WebView 的 `Iterator is not defined` / `AbortSignal.any is not a function`
+                 * 之所以还在报，就是因为它根本没被注入。
+                 *
+                 * 两个变量必须拼在一起注入：SIMULATE_OLD_WEBVIEW 只是对照实验用的删除器，
+                 * 正式构建里它是空字符串，此时等价于"只注入垫片"。
+                 */
+                StringBuilder inject = new StringBuilder();
+                if (SIMULATE_OLD_WEBVIEW != null) inject.append(SIMULATE_OLD_WEBVIEW);
                 if (webCompatShim != null && !webCompatShim.isEmpty()) {
-                    // TEST-B：删除器 + 垫片 → 应当恢复正常
-                    view.evaluateJavascript(SIMULATE_OLD_WEBVIEW + webCompatShim, null);
+                    inject.append('\n').append(webCompatShim);
+                }
+                if (inject.length() > 0) {
+                    view.evaluateJavascript(inject.toString(), null);
                 }
             }
 
@@ -668,7 +702,19 @@ public class MainActivity extends Activity {
         Log.i(TAG, "=== RESULT ===\n" + r);
         runOnUiThread(() -> {
             String cur = output.getText().toString();
-            output.setText(cur.replace("检查中…\n", "") + r);
+            if (sLastFailure != null) {
+                /*
+                 * ⚠️ 失败时**只能追加，不能整段替换**。
+                 *
+                 * onProvisionFailed 在 awaitUrl 超时时已经把"为什么失败"写进了日志区，
+                 * 而这里原来是 setText(cur + r) —— 会把那段原因整个擦掉，
+                 * 用户屏幕上就只剩"初始化失败"四个字，看不到任何线索
+                 * （朋友截图里就是这个现象）。
+                 */
+                output.setText(cur + r);
+            } else {
+                output.setText(cur.replace("检查中…\n", "") + r);
+            }
         });
     }
 
@@ -1305,31 +1351,85 @@ public class MainActivity extends Activity {
 
                 String nodePath = "/opt/" + NODE_DIR + "/bin";
                 progress(sb, "  npm install -g @deepseek-ai/dsh（包较多，可能 5-15 分钟，请勿锁屏）…\n");
-                // 流式执行：输出实时写入报告，便于 PC 侧轮询进度；
-                // 用 npm 专用的长超时（25 分钟总时长 / 5 分钟无输出即判卡死）。
-                int code;
-                try {
-                    code = execStreaming(new String[]{
-                            new File(base, "proot").getAbsolutePath(),
-                            "-r", rootfs.getAbsolutePath(), "-0", "-w", "/root",
-                            "-b", "/dev", "-b", "/proc", "-b", "/sys",
-                            "/usr/bin/env", "-i",
-                            "HOME=/root",
-                            "PATH=" + nodePath + ":/usr/local/bin:/usr/bin:/bin",
-                            "npm_config_registry=https://registry.npmmirror.com",
-                            "npm_config_cache=/root/.npm",
-                            "npm_config_fetch_timeout=60000",
-                            "npm_config_fetch_retries=3",
-                            "npm_config_update_notifier=false",
-                            nodePath + "/npm", "install", "-g", "@deepseek-ai/dsh",
-                            "--no-audit", "--no-fund", "--loglevel=http"},
-                            libDir, sb, NPM_TIMEOUT_MS, NPM_IDLE_MS);
-                } catch (java.util.concurrent.TimeoutException te) {
-                    progress(sb, "  ❌ npm 卡死，已中止：" + te.getMessage() + "\n");
-                    progress(sb, "     常见原因：容器内 DNS 不通 / 网络被限制。可以点右上角「重试」重来。\n");
-                    return sb + "  结果 : ❌ FAIL — npm install 卡死（" + te.getMessage() + "）\n";
+
+                /*
+                 * npm 失败时**必须能看到它自己说了什么**。
+                 *
+                 * 实测有用户的手机上 npm 直接以退出码 217 失败（一个不常见的码），
+                 * 而没有 npm 的输出就无从判断是网络、缓存损坏、还是 Node 本身有问题。
+                 * 这里：最多试 3 次（每次之间清掉 npm 缓存与半成品），
+                 * 换一次官方源；都失败就把 npm 最后几十行原样显示出来。
+                 */
+                int code = -1;
+                boolean ok = false;
+                for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+                    if (attempt > 1) {
+                        progress(sb, "  ⚠️ 第 " + (attempt - 1) + " 次失败（退出码 " + code
+                                + "），清理缓存后重试…\n");
+                        deleteRecursively(new File(rootfs, "root/.npm"));
+                        deleteRecursively(new File(rootfs,
+                                "opt/" + NODE_DIR + "/lib/node_modules/@deepseek-ai"));
+                    }
+                    // 第三次换官方源（镜像偶发缺包/损坏）
+                    String registry = TEMP_BROKEN_REGISTRY != null ? TEMP_BROKEN_REGISTRY
+                            : (attempt >= 3 ? "https://registry.npmjs.org"
+                                            : "https://registry.npmmirror.com");
+                    try {
+                        code = execStreaming(new String[]{
+                                new File(base, "proot").getAbsolutePath(),
+                                "-r", rootfs.getAbsolutePath(), "-0", "-w", "/root",
+                                "-b", "/dev", "-b", "/proc", "-b", "/sys",
+                                "/usr/bin/env", "-i",
+                                "HOME=/root",
+                                "PATH=" + nodePath + ":/usr/local/bin:/usr/bin:/bin",
+                                "npm_config_registry=" + registry,
+                                "npm_config_cache=/root/.npm",
+                                "npm_config_fetch_timeout=60000",
+                                "npm_config_fetch_retries=3",
+                                "npm_config_update_notifier=false",
+                                nodePath + "/npm", "install", "-g", "@deepseek-ai/dsh",
+                                "--no-audit", "--no-fund", "--loglevel=http"},
+                                libDir, sb, NPM_TIMEOUT_MS, NPM_IDLE_MS);
+                    } catch (java.util.concurrent.TimeoutException te) {
+                        progress(sb, "  ❌ npm 卡死，已中止：" + te.getMessage() + "\n");
+                        progress(sb, "     常见原因：容器内 DNS 不通 / 网络被限制。可以点右上角「重试」重来。\n");
+                        return sb + "  结果 : ❌ FAIL — npm install 卡死（" + te.getMessage() + "）\n";
+                    }
+                    progress(sb, "  npm 退出码: " + code + "（源: " + registry + "）\n");
+                    ok = dshBin.exists();
                 }
-                progress(sb, "  npm 退出码: " + code + "\n");
+
+                if (!ok) {
+                    /*
+                     * 把 npm 的真实输出摊开 —— 这是唯一能定位 217 这种东西的办法。
+                     * 同时跑一个最小的 node 自检：如果连 `node -e` 都起不来，
+                     * 那就是这台手机的 Node 有问题，而不是 npm / 网络。
+                     */
+                    progress(sb, "  ── npm 最后输出 ──\n" + execTailText() + "\n");
+                    String nodeCheck;
+                    try {
+                        nodeCheck = oneLine(exec(new String[]{
+                                new File(base, "proot").getAbsolutePath(),
+                                "-r", rootfs.getAbsolutePath(), "-0", "-w", "/root",
+                                "-b", "/dev", "-b", "/proc", "-b", "/sys",
+                                "/usr/bin/env", "-i", "HOME=/root",
+                                "PATH=" + nodePath + ":/usr/local/bin:/usr/bin:/bin",
+                                nodePath + "/node", "-e",
+                                "console.log('NODE_OK', process.version, process.arch)"},
+                                libDir));
+                    } catch (Throwable t) {
+                        nodeCheck = "自检失败: " + t;
+                    }
+                    progress(sb, "  ── node 自检 ──\n    " + nodeCheck + "\n");
+                    StringBuilder hint = new StringBuilder();
+                    if (!nodeCheck.contains("NODE_OK")) {
+                        hint.append("     · 连 `node -e` 都跑不起来 → 这台手机的容器里 Node 无法运行\n");
+                    } else {
+                        hint.append("     · Node 本身正常 → 问题在 npm 下载/解包（网络或镜像）\n");
+                    }
+                    hint.append("     · 可以点右上角「重试」；长按「重试」可清空容器完全重来\n");
+                    progress(sb, hint.toString());
+                }
             } else {
                 sb.append("  dsh 已安装，跳过 npm install\n");
             }
@@ -1442,6 +1542,15 @@ public class MainActivity extends Activity {
                 n++;
                 if (n <= 400 || n % 20 == 0) {        // 限制写入量，避免报告爆炸
                     appendReport("    | " + line + "\n");
+                }
+                // 保留最后若干行 —— 失败时要把它原样摊给用户看
+                synchronized (sExecTail) {
+                    sExecTail.addLast(line);
+                    while (sExecTail.size() > EXEC_TAIL_MAX) sExecTail.removeFirst();
+                }
+                // 像报错的行实时显示到界面上，否则用户只能干等
+                if (looksLikeErrorLine(line)) {
+                    liveProgress("    ↳ " + line + "\n");
                 }
             }
         } catch (Throwable readErr) {
@@ -1705,6 +1814,17 @@ public class MainActivity extends Activity {
                 appendReport("  ✅ 服务就绪（前台服务）: " + u + "\n");
                 return;
             }
+            /*
+             * 20 秒还没看到前台服务被创建，就不用再等 4 分钟了 ——
+             * 这说明 startForegroundService 根本没生效（被系统拦截），
+             * 直接给出确切原因，比笼统的"超时"有用得多。
+             */
+            if (i == 20 && !DshService.isCreated()) {
+                onProvisionFailed(new IllegalStateException(
+                        "前台服务没有启动起来（系统可能拦截了后台服务）。\n"
+                      + "   · 请到系统设置里允许本应用「自启动 / 后台运行」后点「重试」"));
+                return;
+            }
             if (i % 5 == 4) {
                 final String st = DshService.getState();
                 final long el = System.currentTimeMillis() - t0;
@@ -1719,9 +1839,15 @@ public class MainActivity extends Activity {
          * 原来这里只是往日志追加一行，界面既不恢复也没有任何可点的东西 ——
          * 用户看到的就是"卡住了"，唯一出路是卸载重装。
          * 现在走 onProvisionFailed：日志区恢复可见、给出原因、亮出「重试」。
+         *
+         * 并且把 dsh 自己最后的输出一起带出来 —— 这才是真正能定位问题的信息
+         * （端口占用 / 依赖缺失 / 启动异常都会体现在那里）。
          */
         onProvisionFailed(new java.util.concurrent.TimeoutException(
-                "等待 dsh web 超时（4 分钟）· 容器状态: " + DshService.getState()));
+                "等待 dsh web 超时（4 分钟）\n"
+              + "   · 服务状态: " + DshService.getState() + "\n"
+              + "   · 端口: 127.0.0.1:" + Env.port() + "\n"
+              + "   · dsh 最后输出:\n" + DshService.getRecentOutput()));
     }
 
     private void startDshService() {
@@ -1742,6 +1868,17 @@ public class MainActivity extends Activity {
          */
         if (DshService.getNeedsProvision() && !sProvisioning.get()) {
             startProvisioning("回到前台补跑");
+            return;
+        }
+        /*
+         * 容器在后台被重启过时（token 变了 / 端口换了），WebView 还指着旧地址，
+         * 表现就是"界面连不上/一直转圈"。回到前台发现地址变了就重新加载。
+         */
+        String cur = DshService.getUrl();
+        if (cur != null && !cur.equals(dshUrl) && !sProvisioning.get()) {
+            appendReport("  · 容器地址已变化，重新加载 WebView: " + cur + "\n");
+            dshUrl = cur;
+            onServerReady(cur);
         }
     }
 

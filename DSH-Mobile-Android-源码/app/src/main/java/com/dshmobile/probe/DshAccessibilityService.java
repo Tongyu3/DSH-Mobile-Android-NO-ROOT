@@ -134,6 +134,14 @@ public class DshAccessibilityService extends AccessibilityService {
     public boolean onUnbind(android.content.Intent intent) {
         sInstance = null;
         Log.i(TAG, "无障碍服务已断开");
+        /*
+         * 解绑是最快的"权限掉了"信号 —— 立即叫醒守护去检查并补回来，
+         * 不用干等下一个 3 秒轮询周期。
+         *
+         * 注意：用户在本 App 里关掉「无障碍守护」后，守护会自己停手，
+         * 所以这里无条件 nudge 不会造成"关不掉"。
+         */
+        A11yGuard.nudge();
         return super.onUnbind(intent);
     }
 

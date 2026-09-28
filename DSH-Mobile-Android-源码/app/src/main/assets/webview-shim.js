@@ -93,6 +93,106 @@
       def(P, 'join', function (sep) { return toArr(this).join(sep === undefined ? ',' : sep); });
     });
 
+  // ── AbortSignal.any（Chrome 116+）────────────────────────
+  /*
+   * 实测症状（一台平板）：打开「选择工作区目录」直接报
+   *     AbortSignal.any is not a function
+   * 目录列不出来，而且侧边栏一直显示"未连接" ——
+   * 因为 DSH 客户端把 AbortSignal.any 用在了统一的请求/中断封装里，
+   * 它一抛错，所有请求（包括连接层）都会失败。
+   */
+  need(function () { return typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function'; },
+    'AbortSignal.any', function () {
+      def(AbortSignal, 'any', function (signals) {
+        var ctrl = new AbortController();
+        var arr = [];
+        if (signals != null && typeof signals[Symbol.iterator] === 'function') {
+          for (var s of signals) arr.push(s);
+        }
+        for (var i = 0; i < arr.length; i++) {
+          (function (sig) {
+            if (!sig) return;
+            if (sig.aborted) { abortWith(ctrl, sig.reason); return; }
+            try {
+              sig.addEventListener('abort', function () { abortWith(ctrl, sig.reason); }, { once: true });
+            } catch (e) { /* 忽略非法 signal */ }
+          })(arr[i]);
+        }
+        return ctrl.signal;
+      });
+    });
+
+  // ── AbortSignal.timeout（Chrome 103+）────────────────────
+  need(function () { return typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'; },
+    'AbortSignal.timeout', function () {
+      def(AbortSignal, 'timeout', function (ms) {
+        var ctrl = new AbortController();
+        setTimeout(function () {
+          var reason;
+          try { reason = new DOMException('signal timed out', 'TimeoutError'); } catch (e) { reason = undefined; }
+          abortWith(ctrl, reason);
+        }, ms);
+        return ctrl.signal;
+      });
+    });
+
+  // ── AbortSignal.prototype.throwIfAborted（Chrome 100+）───
+  need(function () { return typeof AbortSignal !== 'undefined'
+        && typeof AbortSignal.prototype.throwIfAborted === 'function'; },
+    'AbortSignal.throwIfAborted', function () {
+      def(AbortSignal.prototype, 'throwIfAborted', function () {
+        if (this.aborted) throw (this.reason !== undefined ? this.reason : new Error('Aborted'));
+      });
+    });
+
+  /** abort(reason) 在 Chrome 98 之前不接收原因，这里做兼容。 */
+  function abortWith(ctrl, reason) {
+    try {
+      if (reason === undefined) ctrl.abort();
+      else ctrl.abort(reason);
+    } catch (e) {
+      try { ctrl.abort(); } catch (e2) { /* 已经 aborted */ }
+    }
+  }
+
+  // ── structuredClone（Chrome 98+）────────────────────────
+  need(function () { return typeof structuredClone === 'function'; }, 'structuredClone', function () {
+    // 同步实现：覆盖常见类型 + 循环引用；不支持的类型按规范抛 DataCloneError
+    function clone(v, seen) {
+      if (v === null || typeof v !== 'object') {
+        if (typeof v === 'function' || typeof v === 'symbol') {
+          throw new DOMException('could not be cloned', 'DataCloneError');
+        }
+        return v;
+      }
+      if (seen.has(v)) return seen.get(v);
+      var out;
+      if (v instanceof Date) return new Date(v.getTime());
+      if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+      if (v instanceof Map) {
+        out = new Map(); seen.set(v, out);
+        v.forEach(function (val, k) { out.set(clone(k, seen), clone(val, seen)); });
+        return out;
+      }
+      if (v instanceof Set) {
+        out = new Set(); seen.set(v, out);
+        v.forEach(function (val) { out.add(clone(val, seen)); });
+        return out;
+      }
+      if (v instanceof ArrayBuffer) return v.slice(0);
+      if (ArrayBuffer.isView(v)) return new v.constructor(v.buffer.slice(0));
+      if (Array.isArray(v)) {
+        out = []; seen.set(v, out);
+        for (var i = 0; i < v.length; i++) out[i] = clone(v[i], seen);
+        return out;
+      }
+      out = {}; seen.set(v, out);
+      for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) out[k] = clone(v[k], seen);
+      return out;
+    }
+    def(g, 'structuredClone', function (v) { return clone(v, new WeakMap()); });
+  });
+
   // ── Promise.withResolvers（Chrome 119+）──────────────────
   need(function () { return typeof Promise.withResolvers === 'function'; }, 'Promise.withResolvers', function () {
     def(Promise, 'withResolvers', function () {

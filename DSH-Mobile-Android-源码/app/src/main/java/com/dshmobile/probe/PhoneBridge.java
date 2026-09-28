@@ -208,9 +208,42 @@ public final class PhoneBridge {
         return m;
     }
 
+    /**
+     * 把用户说的「应用名或包名」解析成白名单里的真实包名；解析不到返回 null。
+     *
+     * <p>抽出来是为了让无障碍后端和「直接命令」后端共用同一套匹配规则 ——
+     * 否则两条路对"什么算白名单内的应用"判断不一致，等于开了个后门。
+     */
+    private static String resolveAllowed(Context ctx, String q) {
+        Set<String> allow = allowed(ctx);
+        android.content.pm.PackageManager pm = ctx.getPackageManager();
+        android.content.Intent main = new android.content.Intent(
+                android.content.Intent.ACTION_MAIN)
+                .addCategory(android.content.Intent.CATEGORY_LAUNCHER);
+        String fuzzy = null;
+        for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(main, 0)) {
+            String pkg = ri.activityInfo.packageName;
+            if (!allow.contains(pkg)) continue;              // 白名单外直接跳过
+            String label;
+            try {
+                label = pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString();
+            } catch (Throwable t) {
+                label = pkg;
+            }
+            if (pkg.equalsIgnoreCase(q) || label.equalsIgnoreCase(q)) return pkg;
+            if (fuzzy == null && label.toLowerCase().contains(q.toLowerCase())) fuzzy = pkg;
+        }
+        return fuzzy;
+    }
+
+    private static String openMissMessage(Context ctx, String q) {
+        return "ERROR 白名单里没有匹配「" + q + "」的应用。\n"
+             + "白名单当前为: " + allowed(ctx) + "\n"
+             + "请让用户先在 App 的「📱 手机控制」里加入该应用。\n";
+    }
+
     /** 白名单校验：返回当前前台包名（通过），或 null（被拒）。 */
-    private static String guard(Context ctx) {
-        if (!DshAccessibilityService.isRunning()) {
+    private static String guard(Context ctx) {        if (!DshAccessibilityService.isRunning()) {
             throw new IllegalStateException(
                     "无障碍服务未开启。请在 设置 → 无障碍 中打开「DSH 手机控制」");
         }
@@ -227,6 +260,40 @@ public final class PhoneBridge {
     }
 
     private static String dispatch(Context ctx, String path, java.util.Map<String, String> p) {
+        /*
+         * 用户选了「直接命令」后端且 Shizuku 可用时，这些动作改走 shell。
+         *
+         * 注意白名单校验在 ShellControl 内部照原样执行 —— 这条路的权限比无障碍大，
+         * 边界更不能松。不在这份 switch 里的接口（/apps 等）继续走无障碍实现，
+         * 因为它们本来就不需要 shell。
+         */
+        if (ShellControl.active(ctx)) {
+            try {
+                switch (path) {
+                    case "/status": return ShellControl.status(ctx);
+                    case "/ui":     return ShellControl.dumpUi(ctx);
+                    case "/tap":    return ShellControl.tap(ctx,
+                            Integer.parseInt(p.get("x")), Integer.parseInt(p.get("y")));
+                    case "/click":  return ShellControl.clickText(ctx, p.get("text"));
+                    case "/swipe":  return ShellControl.swipe(ctx,
+                            Integer.parseInt(p.get("x1")), Integer.parseInt(p.get("y1")),
+                            Integer.parseInt(p.get("x2")), Integer.parseInt(p.get("y2")),
+                            Integer.parseInt(p.getOrDefault("ms", "300")));
+                    case "/text":   return ShellControl.inputText(ctx, p.getOrDefault("value", ""));
+                    case "/key":    return ShellControl.key(ctx, p.getOrDefault("name", ""));
+                    case "/open": {
+                        String q = p.get("q");
+                        if (q == null || q.trim().isEmpty()) return "ERROR 需要 q=<包名或应用名>\n";
+                        String pkg = resolveAllowed(ctx, q.trim());
+                        if (pkg == null) return openMissMessage(ctx, q.trim());
+                        return ShellControl.open(ctx, pkg);
+                    }
+                    default: break;   // 其余接口不涉及 shell，落到下面的无障碍实现
+                }
+            } catch (Throwable t) {
+                return "ERROR " + t.getMessage() + "\n";
+            }
+        }
         switch (path) {
             case "/status": {
                 Set<String> allow = allowed(ctx);
@@ -317,34 +384,16 @@ public final class PhoneBridge {
                 if (allow.isEmpty()) {
                     return "ERROR 白名单为空：请先在 DSH 设置 →「📱 手机控制」里勾选允许操作的应用\n";
                 }
-                android.content.pm.PackageManager pm = ctx.getPackageManager();
-                android.content.Intent main = new android.content.Intent(
-                        android.content.Intent.ACTION_MAIN)
-                        .addCategory(android.content.Intent.CATEGORY_LAUNCHER);
-                String hitPkg = null, hitLabel = null;
-                for (android.content.pm.ResolveInfo ri : pm.queryIntentActivities(main, 0)) {
-                    String pkg = ri.activityInfo.packageName;
-                    if (!allow.contains(pkg)) continue;              // 白名单外直接跳过
-                    String label;
-                    try {
-                        label = pm.getApplicationLabel(
-                                pm.getApplicationInfo(pkg, 0)).toString();
-                    } catch (Throwable t) {
-                        label = pkg;
-                    }
-                    if (pkg.equalsIgnoreCase(q) || label.equalsIgnoreCase(q)
-                            || label.toLowerCase().contains(q.toLowerCase())) {
-                        hitPkg = pkg;
-                        hitLabel = label;
-                        break;
-                    }
-                }
-                if (hitPkg == null) {
-                    return "ERROR 白名单里没有匹配「" + q + "」的应用。\n"
-                         + "白名单当前为: " + allow + "\n"
-                         + "请让用户先在 App 的「📱 手机控制」里加入该应用。\n";
-                }
+                String hitPkg = resolveAllowed(ctx, q);
+                if (hitPkg == null) return openMissMessage(ctx, q);
+                String hitLabel = hitPkg;
                 try {
+                    hitLabel = ctx.getPackageManager()
+                            .getApplicationLabel(ctx.getPackageManager().getApplicationInfo(hitPkg, 0))
+                            .toString();
+                } catch (Throwable ignore) { }
+                try {
+                    android.content.pm.PackageManager pm = ctx.getPackageManager();
                     android.content.Intent launch = pm.getLaunchIntentForPackage(hitPkg);
                     if (launch == null) return "ERROR 该应用没有可启动的入口: " + hitPkg + "\n";
                     launch.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);

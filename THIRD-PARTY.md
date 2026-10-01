@@ -68,6 +68,27 @@ MIT 许可证全文见 [`LICENSES/MIT-libandroid-shmem.txt`](LICENSES/MIT-liband
 
 ---
 
+## 5. Shizuku API
+
+| 项目 | 内容 |
+|---|---|
+| 用途 | 让**没有电脑**的用户也能完成一次 `pm grant` 授权：Shizuku 以 shell 身份替本 App 执行命令 |
+| 版本 | `dev.rikka.shizuku:api:13.1.5` + `dev.rikka.shizuku:provider:13.1.5`（Maven Central） |
+| 许可证 | **Apache License 2.0** |
+| 许可证全文 | [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt) |
+| 版权 | Copyright Rikka 及 Shizuku 贡献者 |
+| 上游 | https://github.com/RikkaApps/Shizuku |
+| 修改 | **未修改**，以 Maven 依赖原样编译进 APK |
+
+> 注意区分两件事：
+> 1. **上表这两个库是编译进本 APK 的**（Apache-2.0，随包附带许可证全文即可）；
+> 2. **Shizuku 应用本身不在本 APK 里**。它由用户自行安装（我们的「分享包」里
+>    另外附带了一份官方 APK，同样附带许可证与来源说明，见 `分享/shizuku/`）。
+>
+> 本 App 只通过 Shizuku 执行一条 `pm grant` 命令，不依赖它的任何其它能力。
+
+---
+
 ## 不在 APK 里、但首次运行时会从官方源下载的组件
 
 这些**不随 APK 分发**，是用户设备上的包管理器/下载器从官方地址拉取的，
@@ -78,6 +99,21 @@ MIT 许可证全文见 [`LICENSES/MIT-libandroid-shmem.txt`](LICENSES/MIT-liband
 | Ubuntu Base 24.04（arm64 rootfs） | 各自自由软件许可 | `cdimage.ubuntu.com` / 阿里云镜像 |
 | Node.js v22.23.2 | MIT | `nodejs.org` / 淘宝镜像 |
 | DeepSeek Harness（`@deepseek-ai/dsh`） | 以官方仓库声明为准 | npm registry |
+
+---
+
+## 「插件」单独一份 —— 见 `docs/第三方插件清单.md`
+
+本文件讲的是**二进制与库**（proot、libtalloc、Shizuku…）。
+如果你要的是**插件**（哪些是官方插件、哪些是用户自装的、责任怎么划、
+以及可直接粘贴的免责声明措辞），看 **`docs/第三方插件清单.md`**。三句话摘要：
+
+- **打进 APK 的第三方插件：0 个** —— `assets/` 里有两个插件包 `dsh-phone` 与
+  `dsh-phone-files`，**都是本项目自研的**（源码在 `plugin/` 下，MIT）；
+- 首次运行自动安装的插件**全部来自 DeepSeek 官方**（`@deepseek-ai/*`；装机版本
+  `0.2.0-rc.2` 的依赖树里共 223 个官方包，界面上可见可开关的官方插件 8 个）；
+- 社区第三方插件**只能由用户**从「插件市场」自行安装，本项目不预置、不审核、不担保。
+  装到不兼容的插件会让界面起不来 —— App 会自动把它停掉并恢复界面，可一键恢复。
 
 ---
 

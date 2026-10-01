@@ -1,0 +1,8 @@
+# 组合包声明 —— 少了这个文件，DSH 会把这个插件判成
+# 「这个包没有声明组合包，不能作为插件管理」（真机实测的原文）。
+#
+# id 必须与 lib/index.js 里 `export const name` 完全一致；
+# name 是包名。不一致时插件会**静默不生效**，这是最容易踩的坑。
+- insert:
+    - id: phone-files
+      name: dsh-phone-files

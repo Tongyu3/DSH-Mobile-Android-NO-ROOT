@@ -1,0 +1,29 @@
+{
+  "name": "dsh-phone",
+  "version": "1.0.2",
+  "description": "让 DeepSeek Harness 直接操作安卓手机：截图、读界面、点击、输入、打开应用。所有操作受 App 内的应用白名单限制。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "android",
+    "deepseek-harness"
+  ],
+  "license": "MIT"
+}

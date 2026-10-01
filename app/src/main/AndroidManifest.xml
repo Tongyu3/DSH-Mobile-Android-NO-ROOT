@@ -18,6 +18,39 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
+    <!--
+      权限自愈：把「无障碍」开关被系统/厂商策略关掉之后自动写回去。
+
+      这个权限的 protectionLevel 是 signature|privileged|development，
+      普通应用装完拿不到，但**带 development 标志的权限可以用 pm grant 单独授予**：
+
+          adb shell pm grant com.dshmobile.probe android.permission.WRITE_SECURE_SETTINGS
+
+      关键点：pm grant 的结果是**持久化**的（写进 packages.xml，
+      重启、清后台都不会掉），所以只需要做一次。
+      这也正是"懒人版"的可行形态 —— 一次性动作，之后 App 自己搞定。
+
+      没有它的时候，App 依然能检测到无障碍被关，但只能弹窗让用户手动去开。
+    -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
+    <!--
+      麦克风：**只声明，安装时不会授予任何东西**。
+      Android 6+ 的危险权限本来就必须运行时申请，所以这不会让 App
+      "一装上就能听"；它只是让"申请"这件事成为可能。
+
+      为什么必须声明（这是个真实的坑）：
+      未在清单里声明的权限，运行时申请会被系统**直接拒绝且不弹框**，
+      连 WebView 的音频捕获请求也会一起被拒 —— 表现是网页调用
+      getUserMedia 立刻失败，用户完全看不到任何授权提示。
+
+      用途：让容器里的 DSH 页面能用本地语音识别（getUserMedia / MediaRecorder）。
+      授权时机有两个，都由用户自己决定：
+        · 网页真的请求麦克风时，MainActivity.onPermissionRequest 弹系统授权框；
+        · 或者用户主动去「手机控制 → 麦克风权限」点一下。
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
     <!-- DSH Web UI 走 http://127.0.0.1:<port>，需要允许明文回环流量 -->
     <application
         android:label="@string/app_name"
@@ -27,15 +60,139 @@
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
+        <!--
+          MainActivity 本身**不再挂 LAUNCHER**，桌面入口交给下面那组 activity-alias。
+
+          ⚠️ 为什么要用别名：Android 不允许第三方 App 运行时换桌面图标 ——
+          manifest 里的 android:icon 必须是**编译进 APK 的资源**。
+          唯一可行的办法就是预先声明好几个 entry，每个带不同图标，
+          再用 PackageManager.setComponentEnabledSetting 只启用其中一个。
+
+          MainActivity 仍然 exported=true：老版本留下的桌面快捷方式指向的就是它，
+          不改的话用户升级后那一个图标会点不开。
+        -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="@string/app_name">
+            android:label="@string/app_name" />
+
+        <!--
+          桌面图标可选配色。同一套前景图（那只鲸鱼），只换背景色。
+          一次只启用一个 —— 由 IconSwitcher.apply() 保证，
+          而且要**先启用新的、再禁用旧的**，中间不能出现"一个都没启用"的空档
+          （那会让桌面图标直接消失）。
+        -->
+        <activity-alias
+            android:name=".IconWhite"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_white"
+            android:roundIcon="@mipmap/ic_launcher_white"
+            android:label="@string/app_name"
+            android:enabled="true"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconSky"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_sky"
+            android:roundIcon="@mipmap/ic_launcher_sky"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconMint"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_mint"
+            android:roundIcon="@mipmap/ic_launcher_mint"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconLilac"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_lilac"
+            android:roundIcon="@mipmap/ic_launcher_lilac"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconPeach"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_peach"
+            android:roundIcon="@mipmap/ic_launcher_peach"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconForest"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_forest"
+            android:roundIcon="@mipmap/ic_launcher_forest"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconNavy"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_navy"
+            android:roundIcon="@mipmap/ic_launcher_navy"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".IconInk"
+            android:targetActivity=".MainActivity"
+            android:icon="@mipmap/ic_launcher_ink"
+            android:roundIcon="@mipmap/ic_launcher_ink"
+            android:label="@string/app_name"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
 
         <!-- 常驻服务：维持 dsh web 进程。targetSdk 28 故无需 foregroundServiceType。 -->
         <service
@@ -64,6 +221,102 @@
         <activity
             android:name=".AppControlActivity"
             android:exported="false"
-            android:label="📱 手机控制" />
+            android:label="手机控制" />
+
+        <!-- 插件市场：列出 npm 上的 dsh 插件并一键安装 -->
+        <activity
+            android:name=".PluginMarketActivity"
+            android:exported="false"
+            android:label="插件市场" />
+
+        <!-- 应用白名单：勾选允许 DSH 操作的 App（整屏，列表才是主角） -->
+        <activity
+            android:name=".WhitelistActivity"
+            android:exported="false"
+            android:label="应用白名单" />
+
+        <!--
+          容器常驻服务：给 CLIProxyAPI 这类**本地代理**用 ——
+          它必须先跑起来客户端才连得上，而它自己没有任何"启动键"。
+          配一次，App 负责自启 + 挂了重拉。
+        -->
+        <activity
+            android:name=".ServicesActivity"
+            android:exported="false"
+            android:label="容器常驻服务" />
+
+        <!-- 内核升级：检测 DSH 版本 → 一键升级 -->
+        <activity
+            android:name=".UpgradeActivity"
+            android:exported="false"
+            android:label="DSH 内核升级" />
+
+        <!-- 桌面图标配色选择（通知栏图标跟着一起换） -->
+        <activity
+            android:name=".IconActivity"
+            android:exported="false"
+            android:label="桌面图标" />
+
+        <!-- 「手机权限」大类：把手机控制/白名单/插件市场/常驻服务/内核升级/桌面图标收在一起 -->
+        <activity
+            android:name=".PhonePermActivity"
+            android:exported="false"
+            android:label="手机权限" />
+
+        <!--
+          DSH 内置输入法：唯一目的是"用键盘的方式"把文字送进微信这类
+          会拦截 ACTION_SET_TEXT / input text 的应用。
+
+          它平时不该被用户选中 —— App 会在需要时用 WRITE_SECURE_SETTINGS
+          临时把默认输入法切到它，用完再切回用户原来的那个。
+          BIND_INPUT_METHOD 是系统要求的权限，只有系统能绑，别的应用绑不上。
+        -->
+        <service
+            android:name=".DshImeService"
+            android:exported="true"
+            android:label="DSH 输入"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+
+        <!--
+          Shizuku 客户端必需的一环：Shizuku 通过这个 ContentProvider 把 binder 交给本应用。
+          android:permission=INTERACT_ACROSS_USERS_FULL 是为了**阻止普通应用**访问它 ——
+          这是 Shizuku 官方文档规定的写法，不是我们额外要的权限。
+          没有装 Shizuku 的手机上，这个 provider 就是静静地待着，不会报错。
+        -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!--
+          「用别的应用打开」必需的 FileProvider。
+
+          为什么不能直接把 file:// 塞进 Intent：本 App 的 targetSdk = 28，
+          Android 7.0 起对 targetSdk ≥ 24 的应用会抛 FileUriExposedException。
+          所以必须换成 content:// 并临时授予读权限，见 {@link OpenWith}。
+
+          exported=false + grantUriPermissions=true 是标准组合：
+          别的应用拿不到这个 provider，只能通过我们显式授权的那一个 URI 读。
+          能暴露哪些目录由 res/xml/file_paths.xml 决定。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

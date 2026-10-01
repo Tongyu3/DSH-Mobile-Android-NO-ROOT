@@ -57,10 +57,12 @@ const USAGE = `phone —— 操作手机（受 App 白名单限制）
   phone apps                       列出白名单应用
   phone open "应用名或包名"         启动白名单里的应用（如 phone open QQ）
   phone ui                         读取当前界面（控件树 + 坐标）
+  phone shot                       截屏并保存为图片（**看微信/QQ 只能靠这个**）
   phone tap X Y                    按坐标点击
   phone click "文字"                点击包含该文字/描述的控件
   phone swipe X1 Y1 X2 Y2 [毫秒]    滑动（默认 300ms）
-  phone text "内容"                 往当前焦点输入框写文字
+  phone text "内容"                 往当前焦点输入框写文字（微信会自动改用输入法）
+  phone ime [activate|restore]     输入法状态 / 切过来 / 还回去
   phone key back|home|recents|notifications
 
 注意: 只能操作**白名单里**的应用。前台不在白名单时，所有操作（含 phone ui）都会被拒绝。
@@ -81,6 +83,8 @@ switch (cmd) {
   case 'status': call('/status', {}, done); break;
   case 'apps': call('/apps', {}, done); break;
   case 'ui': call('/ui', {}, done); break;
+  case 'shot': call('/shot', {}, done); break;
+  case 'ime': call('/ime', { op: rest[0] || 'status' }, done); break;
   case 'tap':
     if (rest.length < 2) { console.error('用法: phone tap X Y'); process.exit(1); }
     call('/tap', { x: rest[0], y: rest[1] }, done);

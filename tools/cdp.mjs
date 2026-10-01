@@ -9,15 +9,27 @@
 import { readFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
+const crash = args.includes('--crash');
 let expr;
 if (args[0] === '--file') {
   expr = readFileSync(args[1], 'utf8');
-} else {
+} else if (!crash) {
   expr = args[0];
 }
 
 const targets = await (await fetch('http://127.0.0.1:9222/json')).json();
-const page = targets.find(t => t.type === 'page');
+/*
+ * 取**最后一个** page target，而不是第一个。
+ *
+ * 原因：WebView 在发生导航/渲染进程交换时会同时留下新旧两个 target
+ * （实测点"在侧边栏预览"之后就是这样，两个 target 标题一模一样）。
+ * 第一个往往是已经作废的那个，连上去只会得到
+ * "Inspected target navigated or closed"。
+ * 需要指定时用环境变量 CDP_TARGET=<序号>。
+ */
+const pages = targets.filter(t => t.type === 'page');
+const want = process.env.CDP_TARGET === undefined ? pages.length - 1 : Number(process.env.CDP_TARGET);
+const page = pages[want] ?? pages[pages.length - 1];
 if (!page) { console.error('没有找到 page target'); process.exit(1); }
 
 const ws = new WebSocket(page.webSocketDebuggerUrl);
@@ -42,6 +54,22 @@ function send(method, params) {
 
 ws.addEventListener('open', async () => {
   try {
+    if (crash) {
+      /*
+       * --crash：主动让 WebView 的渲染进程崩溃。
+       *
+       * 用途：验证 App 侧 onRenderProcessGone 的自愈 —— 用户反馈的"用久了白屏"
+       * 第一大成因就是渲染进程被系统回收，而这条路没法用 adb 直接模拟
+       * （不是 root，杀不了别的 uid 的进程）。Page.crash 能精确触发它。
+       *
+       * 渲染进程一死，这条 WebSocket 也会跟着断 —— 所以"没收到回包"是正常的，
+       * 不要当成失败。
+       */
+      try { await send('Page.enable'); } catch { }
+      await send('Page.crash').catch(() => { });
+      console.log('已发送 Page.crash（连接随渲染进程断开属正常）');
+      process.exit(0);
+    }
     const r = await send('Runtime.evaluate', {
       expression: expr,
       returnByValue: true,

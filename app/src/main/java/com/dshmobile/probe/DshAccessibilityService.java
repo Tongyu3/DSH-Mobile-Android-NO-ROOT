@@ -8,6 +8,7 @@ import android.os.Bundle;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -30,6 +31,16 @@ public class DshAccessibilityService extends AccessibilityService {
     private static volatile DshAccessibilityService sInstance;
     private static volatile String sForegroundPackage = "";
     private static volatile long sForegroundAt = 0L;
+
+    /**
+     * 供 {@link Screenshot} 调用 {@code takeScreenshot()} 用。
+     *
+     * <p>截屏是**实例方法**（不像读界面树那样能靠静态缓存凑合），所以必须把实例暴露出去。
+     * 返回 null 表示服务当前没在跑，调用方据此判断"这条路能不能用"。
+     */
+    static DshAccessibilityService instance() {
+        return sInstance;
+    }
 
     /**
      * 正在取界面树的线程数。
@@ -60,10 +71,53 @@ public class DshAccessibilityService extends AccessibilityService {
      * `TYPE_WINDOW_STATE_CHANGED` 在切换前台应用时必定触发，缓存值就是准的，
      * 而且是纯内存读取、永不阻塞 —— 白名单校验在最热的路径上，不能卡。
      * 缓存实在太旧时，才用带超时的实时查询兜底。
+     *
+     * <h3>⚠️ 取不到时必须返回 null，绝不能返回旧值</h3>
+     * 这里踩过一个**安全相关**的坑：原来的实现在最后一行直接
+     * {@code return sForegroundPackage;}，也就是"刷新失败就把上次的旧包名交出去"。
+     * 后果很实在 —— 无障碍服务被厂商关掉之后，事件不再更新缓存，
+     * 用户随时可以切到微信、再切到银行 App，而我们手里还是那个几十分钟前的旧包名。
+     * 白名单是照旧值判断的，于是**截图 / 点击可能作用在白名单之外的应用上**。
+     *
+     * <p>现在：服务没在跑 → 缓存**不可信**，返回 null；
+     * 刷新失败且缓存过期 → 也返回 null。
+     * 调用方拿到 null 会直接拒绝操作 —— "不知道前台是谁"就什么都不做，
+     * 这才是白名单该有的行为。
      */
     public static String foregroundPackage() {
+        if (sInstance == null) return null;
+
+        /*
+         * 权威来源：**占据屏幕面积最大的那个应用窗口**。
+         *
+         * 为什么不用 isFocused()/isActive()：实测在 vivo 上它们不可靠 ——
+         * systemui 的状态栏/浮层也会被标成 focused，取"第一个聚焦窗口"
+         * 拿到的是 com.android.systemui，而系统自己报的前台是
+         * com.android.settings（mCurrentFocus 与 topResumedActivity 一致）。
+         * 后果是所有操作都被白名单拒掉，看起来却像"白名单配错了"。
+         *
+         * 按面积取就没有这个歧义：用户正在看的应用窗口一定占了大半屏，
+         * 状态栏是一条、浮层是一小块。
+         */
+        String dom = dominantWindowPackage();
+        if (dom != null && !dom.isEmpty()) {
+            sForegroundPackage = dom;
+            sForegroundAt = System.currentTimeMillis();
+            // 顺手记住"上一个别人"，供白名单一键添加使用
+            // （这里在静态方法里，所以只能通过 sInstance 取包名）
+            try {
+                DshAccessibilityService s = sInstance;
+                if (s != null && !dom.equals(s.getPackageName())) {
+                    sLastOtherPkg = dom;
+                    sLastOtherAt = System.currentTimeMillis();
+                }
+            } catch (Throwable ignore) { }
+            return dom;
+        }
+
+        // 取不到窗口列表（没开 flagRetrieveInteractiveWindows）时退回老路
         long age = System.currentTimeMillis() - sForegroundAt;
-        if (!sForegroundPackage.isEmpty() && age < 5000L) return sForegroundPackage;
+        if (!sForegroundPackage.isEmpty() && age < 2000L) return sForegroundPackage;
 
         AccessibilityNodeInfo root = root();
         try {
@@ -75,7 +129,116 @@ public class DshAccessibilityService extends AccessibilityService {
             }
         } catch (Throwable ignore) { }
 
-        return sForegroundPackage;
+        return age < 2000L ? sForegroundPackage : null;
+    }
+
+    private static volatile String sDomPkg = null;
+    private static volatile long sDomAt = 0L;
+
+    /*
+     * 上一个"占据屏幕最大面积的应用窗口"是谁、什么时候的事。
+     *
+     * 用途只有一个：系统弹窗（「选择打开方式」）会**整屏顶掉**白名单应用，
+     * 于是白名单校验看到的前台变成了 com.android.intentresolver 而被拒。
+     * 要看穿这种"临时弹窗"，就得知道**它之前是谁在前台** ——
+     * 实测 SYSTEM DIALOG 是全屏窗口时 getWindows() 里**看不到**底下的应用，
+     * 所以只能靠历史记录。
+     */
+    private static volatile String sPrevPkg = null;
+    private static volatile long sPrevAt = 0L;
+
+    /** 上一次的前台包名；超过 15 秒就当过期（窗口切换很快，超过这个时间不是同一次操作）。 */
+    static String previousPackage() {
+        if (sPrevPkg == null || sPrevPkg.isEmpty()) return null;
+        if (System.currentTimeMillis() - sPrevAt > 15000L) return null;
+        return sPrevPkg;
+    }
+
+    /*
+     * 最近一个"不是本 App 自己"的前台包名。
+     *
+     * 用途：用户在 App 里点「把刚才那个应用加入白名单」时，
+     * 此刻的前台其实是**我们自己**（用户正看着这个页面），
+     * 直接取 foregroundPackage() 只会拿到 com.dshmobile.probe，毫无用处。
+     * 所以单独记住"上一个别人"。
+     */
+    private static volatile String sLastOtherPkg = null;
+    private static volatile long sLastOtherAt = 0L;
+
+    static String lastOtherPackage() {
+        if (sLastOtherPkg == null || sLastOtherPkg.isEmpty()) return null;
+        // 太旧的就不认了，免得把十分钟前偶然路过的应用加进来
+        if (System.currentTimeMillis() - sLastOtherAt > 10 * 60 * 1000L) return null;
+        return sLastOtherPkg;
+    }
+
+    /**
+     * 面积最大的应用窗口的包名（带缓存 + 有界等待）。
+     *
+     * <h3>⚠️ 必须是有界的，否则会把整个控制桥拖死</h3>
+     * {@code getWindows()} 和每个窗口的 {@code getRoot()} **都是对 system_server 的
+     * 同步 IPC**，和 {@code getRootInActiveWindow()} 一样可能长时间不返回
+     * （实测在前台是别的应用时就会卡住）。而前台判断在**每个**操作的最前面，
+     * 一旦它卡住，所有 phone 命令会一起卡死 —— 这正是之前反复出现的
+     * "控制桥突然整个没响应、只能重启 App"。
+     *
+     * <p>所以这里跟 {@link #root()} 用同一套办法：丢到工作线程里跑 + join 超时；
+     * 结果再缓存 1 秒，避免每次操作都做一轮 IPC。
+     * 超时就**用上一次的值**（稍旧但可用），绝不让调用方无限等。
+     */
+    private static String dominantWindowPackage() {
+        long age = System.currentTimeMillis() - sDomAt;
+        if (sDomPkg != null && age < 1000L) return sDomPkg;
+
+        final String[] box = new String[1];
+        Thread t = new Thread(() -> {
+            try { box[0] = computeDominant(); } catch (Throwable ignore) { }
+        }, "a11y-win");
+        t.setDaemon(true);
+        t.start();
+        try { t.join(800L); } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        if (box[0] != null && !box[0].isEmpty()) {
+            // 换前台了：把"上一个"记下来（系统弹窗的判定要用，见 previousPackage）
+            if (sDomPkg != null && !box[0].equals(sDomPkg)) {
+                sPrevPkg = sDomPkg;
+                sPrevAt = System.currentTimeMillis();
+            }
+            sDomPkg = box[0];
+            sDomAt = System.currentTimeMillis();
+            return box[0];
+        }
+        return sDomPkg;   // 超时/取不到：退回上一次的值（可能为 null）
+    }
+
+    /**
+     * 面积最大的应用窗口的包名；没有应用窗口就退回面积最大的任意窗口。
+     *
+     * <p>⚠️ 里面有 IPC，只能在 {@link #dominantWindowPackage()} 的工作线程里调。
+     */
+    private static String computeDominant() {
+        final DshAccessibilityService s = sInstance;
+        if (s == null) return null;
+        java.util.List<AccessibilityWindowInfo> ws = s.getWindows();
+        if (ws == null || ws.isEmpty()) return null;
+        String best = null, bestApp = null;
+        long bestArea = -1, bestAppArea = -1;
+        Rect r = new Rect();
+        for (AccessibilityWindowInfo w : ws) {
+            AccessibilityNodeInfo root = w.getRoot();
+            if (root == null) continue;
+            CharSequence cn = root.getPackageName();
+            if (cn == null) continue;
+            String pkg = cn.toString();
+            w.getBoundsInScreen(r);
+            long area = (long) Math.max(0, r.width()) * Math.max(0, r.height());
+            if (area > bestArea) { bestArea = area; best = pkg; }
+            if (w.getType() == AccessibilityWindowInfo.TYPE_APPLICATION && area > bestAppArea) {
+                bestAppArea = area; bestApp = pkg;
+            }
+        }
+        return bestApp != null ? bestApp : best;
     }
 
     /** 取当前活动窗口的根节点；带超时，取不到返回 null（绝不长时间阻塞调用方）。 */
@@ -134,6 +297,14 @@ public class DshAccessibilityService extends AccessibilityService {
     public boolean onUnbind(android.content.Intent intent) {
         sInstance = null;
         Log.i(TAG, "无障碍服务已断开");
+        /*
+         * 解绑是最快的"权限掉了"信号 —— 立即叫醒守护去检查并补回来，
+         * 不用干等下一个 3 秒轮询周期。
+         *
+         * 注意：用户在本 App 里关掉「无障碍守护」后，守护会自己停手，
+         * 所以这里无条件 nudge 不会造成"关不掉"。
+         */
+        A11yGuard.nudge();
         return super.onUnbind(intent);
     }
 
@@ -217,13 +388,38 @@ public class DshAccessibilityService extends AccessibilityService {
         AccessibilityNodeInfo cur = n;
         for (int up = 0; up < 6 && cur != null; up++) {
             if (cur.isClickable()) {
-                return cur.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                /*
+                 * 先试 ACTION_CLICK —— 它最"干净"：让控件自己执行点击，
+                 * 不依赖坐标，也不会误点到别的东西。
+                 */
+                if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true;
+
+                /*
+                 * 失败就退回**手势点击**。
+                 *
+                 * 为什么必须留这条退路：实测系统应用（设置）顶部那一排，
+                 * 节点读得到、isClickable() 也是 true，但 ACTION_CLICK 一律返回 false
+                 * —— 因为它所在的窗口不是"活动窗口"，对这种窗口里的节点发动作会被拒。
+                 * 手势走的是输入系统，跟窗口归属无关，所以照样能点中。
+                 *
+                 * 这正是"用不了安卓系统应用的工具栏"的最后一环：
+                 * 先是看不见（独立窗口没读），修完看得见了，却还是点不动。
+                 */
+                Rect cr = new Rect();
+                cur.getBoundsInScreen(cr);
+                if (cr.width() > 0 && cr.height() > 0) {
+                    Log.i(TAG, "ACTION_CLICK 被拒，改用手势点击 ("
+                            + cr.centerX() + "," + cr.centerY() + ")");
+                    return tap(cr.centerX(), cr.centerY());
+                }
+                return false;
             }
             cur = cur.getParent();
         }
-        // 不可点击就退回坐标点击
+        // 整条祖先链都没有 clickable 的：退回按节点中心做手势点击
         Rect r = new Rect();
         n.getBoundsInScreen(r);
+        if (r.width() <= 0 || r.height() <= 0) return false;
         return tap(r.centerX(), r.centerY());
     }
 
@@ -251,6 +447,135 @@ public class DshAccessibilityService extends AccessibilityService {
         StringBuilder sb = new StringBuilder();
         render(root, 0, sb, 0);
         return sb.toString();
+    }
+
+    /**
+     * 把所有窗口的界面树合并输出。
+     *
+     * <h3>为什么需要它（这是个真实故障）</h3>
+     * 原本只读 {@code getRootInActiveWindow()} —— **当前活动窗口的根节点**。
+     * 但很多系统应用（设置、文件管理……）把**顶部工具栏放在独立窗口里**
+     * （CollapsingToolbar / 搜索栏那种），于是我们读到的树里**根本没有那一排**。
+     *
+     * <p>实测对比（系统「设置」首页）：
+     * <pre>
+     * uiautomator:  y=212 "设置"(标题)、y=373 "搜索设置项"(EditText, 可点)
+     * 我们的 phone ui: 第一个节点从 y=522 开始 —— 上面那两条完全没有
+     * </pre>
+     * 结果就是 agent「看得到列表、却看不到也用不了工具栏」，
+     * 而人手动打开设置时那一排明明就在最上面。
+     *
+     * <p>修法：用 {@link AccessibilityService#getWindows()} 拿到所有窗口逐个渲染。
+     * 这需要配置里开 {@code flagRetrieveInteractiveWindows}，否则 getWindows 返回空。
+     *
+     * @return 多窗口合并后的文本；只有一扇窗时返回 null（调用方走原来的单窗口路径）
+     */
+    static String dumpAllWindows() {
+        final DshAccessibilityService s = sInstance;
+        if (s == null) return null;
+        java.util.List<AccessibilityWindowInfo> ws;
+        try {
+            ws = s.getWindows();
+        } catch (Throwable t) {
+            return null;
+        }
+        if (ws == null || ws.size() <= 1) return null;   // 单窗口没必要换实现
+
+        StringBuilder sb = new StringBuilder();
+        int n = 0, empty = 0;
+        for (AccessibilityWindowInfo w : ws) {
+            AccessibilityNodeInfo r = w.getRoot();
+            if (r == null) { empty++; continue; }
+            n++;
+            sb.append("── 窗口 ").append(n)
+              .append(" [").append(windowType(w.getType())).append("] ──\n");
+            render(r, 0, sb, 0);
+        }
+        if (n <= 1) return null;
+        return "（共 " + n + " 个窗口" + (empty > 0 ? "，另有 " + empty + " 个取不到根节点" : "")
+                + "；工具栏常常在独立窗口里，所以这里逐个列出）\n" + sb;
+    }
+
+    /**
+     * 有界地取窗口列表。
+     *
+     * <p>{@code getWindows()} 是对 system_server 的同步 IPC，可能长时间不返回，
+     * 所以和 {@link #root()} / {@link #dominantWindowPackage()} 一样丢到线程里 join 超时。
+     * 诊断接口尤其不能把控制桥拖死 —— 它本来就是"出问题时才用"的。
+     */
+    private static java.util.List<AccessibilityWindowInfo> windowsBounded(long ms) {
+        final DshAccessibilityService s = sInstance;
+        if (s == null) return null;
+        final Object[] box = new Object[1];
+        Thread t = new Thread(() -> {
+            try { box[0] = s.getWindows(); } catch (Throwable ignore) { }
+        }, "a11y-wins");
+        t.setDaemon(true);
+        t.start();
+        try { t.join(ms); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+        @SuppressWarnings("unchecked")
+        java.util.List<AccessibilityWindowInfo> out =
+                (java.util.List<AccessibilityWindowInfo>) box[0];
+        return out;
+    }
+
+    /**
+     * 列出所有窗口的"身份信息"：包名 / 类型 / 区域 / 面积 / 根节点取不取得到 / 类名 / 标题。
+     *
+     * <h3>为什么要有这个接口</h3>
+     * 「选择打开方式」这类系统弹窗是**独立窗口**，而且常常不属于任何白名单应用。
+     * 排查"agent 为什么看不见它 / 点不动它"时，必须先回答三个问题：
+     * <ol>
+     *   <li>它到底在不在 {@code getWindows()} 里（还是只存在于另一个 display）；</li>
+     *   <li>它的 {@code getRoot()} 取不取得到（取不到就只能靠坐标点）；</li>
+     *   <li>它被算成哪个包 —— 白名单校验就是拿这个包名在判，判错了就会误拒。</li>
+     * </ol>
+     * 以前只能靠猜，现在一条 {@code phone windows} 就能看清楚。
+     *
+     * <p>只输出窗口元信息（包名/类型/标题），**不含任何控件文本**，
+     * 所以它不套白名单 —— 否则"被白名单拦住"这种故障就永远看不到现场。
+     */
+    static String describeWindows() {
+        java.util.List<AccessibilityWindowInfo> ws = windowsBounded(1000L);
+        if (ws == null) {
+            return "ERROR 取不到窗口列表（getWindows 超时或服务未运行）\n";
+        }
+        StringBuilder sb = new StringBuilder("窗口数: " + ws.size() + "\n");
+        Rect r = new Rect();
+        int i = 0;
+        for (AccessibilityWindowInfo w : ws) {
+            i++;
+            AccessibilityNodeInfo root = w.getRoot();
+            String pkg = "-", cls = "-", title = "-";
+            if (root != null) {
+                if (root.getPackageName() != null) pkg = root.getPackageName().toString();
+                if (root.getClassName() != null) cls = root.getClassName().toString();
+            }
+            CharSequence tt = w.getTitle();
+            if (tt != null) title = tt.toString().replace('\n', ' ');
+            w.getBoundsInScreen(r);
+            long area = (long) Math.max(0, r.width()) * Math.max(0, r.height());
+            sb.append('[').append(i).append("] ").append(pkg)
+              .append("  ").append(windowType(w.getType()))
+              .append("  (").append(r.left).append(',').append(r.top).append(',')
+              .append(r.right).append(',').append(r.bottom).append(')')
+              .append("  面积=").append(area)
+              .append("  root=").append(root == null ? "取不到" : "OK")
+              .append("  ").append(cls)
+              .append("  \"").append(title).append("\"\n");
+        }
+        return sb.toString();
+    }
+
+    private static String windowType(int t) {
+        switch (t) {
+            case AccessibilityWindowInfo.TYPE_APPLICATION: return "应用";
+            case AccessibilityWindowInfo.TYPE_INPUT_METHOD: return "输入法";
+            case AccessibilityWindowInfo.TYPE_SYSTEM: return "系统";
+            case AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY: return "无障碍浮层";
+            case AccessibilityWindowInfo.TYPE_SPLIT_SCREEN_DIVIDER: return "分屏";
+            default: return "类型" + t;
+        }
     }
 
     private static int render(AccessibilityNodeInfo n, int depth, StringBuilder sb, int counter) {

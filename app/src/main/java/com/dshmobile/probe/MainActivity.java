@@ -31,6 +31,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.GZIPInputStream;
@@ -62,6 +63,8 @@ public class MainActivity extends Activity {
     private TextView output;
     private TextView statusBar;
     private TextView settingsButton;
+    /** 初始化失败时才出现的「重试」；长按 = 清空容器重新初始化。 */
+    private TextView retryButton;
     /** 顶部状态栏整行；DSH 就绪后会整条隐藏，避免常年遮挡视野。 */
     private LinearLayout topBar;
     private WebView webView;
@@ -75,6 +78,128 @@ public class MainActivity extends Activity {
     /** proot 的 loader 路径（必须通过 PROOT_LOADER 指定，见 prepareLibs 注释）。 */
     private String loaderPath;
     private String loader32Path;
+
+    // ── 初始化（首次运行）的健壮性相关 ─────────────────────────
+
+    /**
+     * 防重入：同一个进程里只允许跑一个初始化线程。
+     *
+     * 之前没有这个保护，用户在中途切后台再回来（或旋转屏幕导致 Activity 重建）
+     * 会再起一个 runAllTests，两个线程同时解压 rootfs / 装 npm —— 互相踩踏。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean sProvisioning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** 当前步骤名（给状态栏的耗时提示用）。 */
+    private volatile String sCurrentStep = "准备中";
+    /** 最近一次真正有输出的时刻，给"卡死判定"用。 */
+    private volatile long sLastOutputAt = System.currentTimeMillis();
+    /** 最近一次失败的人话原因（设置对话框里会展示）。 */
+    private volatile String sLastFailure = null;
+    /** 系统 WebView 的 Chrome 版本（用于诊断"老 WebView 跑不了"）。 */
+    private volatile String webViewVersion = "?";
+
+    /*
+     * 对照实验用的"模拟老 WebView"删除器，**正式构建必须留空**。
+     *
+     * 留空时 onPageStarted 只注入 webview-shim.js（兼容垫片）；
+     * 调试时把它填成删除 AbortSignal.any / structuredClone 之类的语句，
+     * 就能在最新版 WebView 上复现老机器的问题（见 0.1.9 的平板排查）。
+     */
+    private static final String SIMULATE_OLD_WEBVIEW = "";
+
+    /** 短命令的默认超时。 */
+    private static final long EXEC_TIMEOUT_MS = 120_000L;
+    private static final long EXEC_IDLE_MS = 120_000L;
+    /** 流式命令保留的最后若干行（失败时展示给用户）。 */
+    private static final int EXEC_TAIL_MAX = 40;
+
+    /*
+     * 启动耗时打点。
+     *
+     * 为什么要在 App 里打点，而不是在外面掐表：这台机器上"进程到底是不是
+     * 新起的"很难从外面判断（前台服务 + 厂商保活会让测量对象飘），
+     * 从外面量出来的数字自相矛盾过。类加载时记 t0，每过一个阶段打一行，
+     * 这样"慢在哪一段"是一手的、不依赖任何外部假设。
+     *
+     * 读法：adb logcat -d | grep START_TIMING
+     */
+    private static final long T0 = System.currentTimeMillis();
+
+    /**
+     * 报告文件的静态引用。
+     *
+     * mark() 是静态的（要在类加载后就可用），而 reportFile 是实例字段，
+     * 所以另存一份静态引用。**打点必须落到文件里** ——
+     * OriginOS 会把 logcat 缓冲清掉（实测整个 buffer 只剩 116 行、我们自己的
+     * 一行都不剩），只写 logcat 的测量结果完全不可信。
+     */
+    private static volatile File sReportFile;
+
+    private static void mark(String what) {
+        String line = "TIMING +" + (System.currentTimeMillis() - T0) + "ms  " + what;
+        Log.i(TAG, "START_TIMING " + line);
+        File f = sReportFile;
+        if (f != null) {
+            try {
+                java.io.FileOutputStream os = new java.io.FileOutputStream(f, true);
+                try {
+                    os.write(("  ⏱ " + line + "\n").getBytes("UTF-8"));
+                } finally {
+                    os.close();
+                }
+            } catch (Throwable ignore) { }
+        }
+    }
+    /*
+     * 留空即正常使用（曾临时指向不可达地址以验证失败诊断链路）。
+     */
+    private static final String TEMP_BROKEN_REGISTRY = null;
+
+    private final java.util.ArrayDeque<String> sExecTail = new java.util.ArrayDeque<>();
+    /** 供失败提示使用：把 tail 拼成文本。 */
+    private String execTailText() {
+        synchronized (sExecTail) {
+            if (sExecTail.isEmpty()) return "    (没有任何输出)";
+            StringBuilder sb = new StringBuilder();
+            for (String l : sExecTail) sb.append("    | ").append(l).append('\n');
+            return sb.toString();
+        }
+    }
+    /** 命令输出里像报错的行（用于实时提示）。 */
+    private static boolean looksLikeErrorLine(String line) {
+        String s = line.toLowerCase();
+        return s.contains("npm err") || s.contains("error") || s.contains("eacces")
+            || s.contains("enoent") || s.contains("enospc") || s.contains("eaddrinuse")
+            || s.contains("cannot") || s.contains("exception") || s.contains("failed")
+            || s.contains("killed") || s.contains("out of memory") || s.contains("segmentation");
+    }
+    /** 容器内 npm install：官方自己都说可能 5-15 分钟，给足但必须有上限。 */
+    private static final long NPM_TIMEOUT_MS = 25 * 60_000L;
+    private static final long NPM_IDLE_MS = 5 * 60_000L;
+    /** 下载：单次最长 15 分钟；连续 60 秒没有任何字节就判定停滞。 */
+    private static final long DOWNLOAD_TIMEOUT_MS = 15 * 60_000L;
+    private static final long DOWNLOAD_STALL_MS = 60_000L;
+    /** 长时间命令的心跳间隔。 */
+    private static final long HEARTBEAT_MS = 15_000L;
+
+    /** 耗时秒数 → "3分12秒" / "42秒"。 */
+    private static String fmtDuration(long ms) {
+        long s = ms / 1000;
+        return s < 60 ? (s + "秒") : (s / 60 + "分" + (s % 60) + "秒");
+    }
+
+    /**
+     * 只往报告与界面追加一行，**不碰 StringBuilder**。
+     *
+     * 心跳是看门狗线程发的，而 StringBuilder 不是线程安全的，
+     * 所以在别的线程里只能走这个（progress() 会写 sb，仅供初始化主线程用）。
+     */
+    private void liveProgress(String line) {
+        appendReport(line);
+        final String l = line;
+        runOnUiThread(() -> output.append(l));
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -110,6 +235,37 @@ public class MainActivity extends Activity {
         bar.addView(settingsButton, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        /*
+         * 「重试」：只在初始化失败时出现。
+         *
+         * 为什么必须有它：原来初始化一旦失败或卡死，界面就永久停在最后一句话上，
+         * 用户唯一的出路是卸载重装（等于把 150MB 再下一遍）。
+         * 短按 = 重跑（各步骤幂等，已完成的不重做）；长按 = 清空容器重来。
+         */
+        retryButton = new TextView(this);
+        retryButton.setText("重试");
+        retryButton.setTextSize(13f);
+        retryButton.setTextColor(Color.parseColor("#FFB86B"));
+        retryButton.setPadding(24, 26, 24, 26);
+        retryButton.setVisibility(View.GONE);
+        retryButton.setOnClickListener(v -> {
+            // 用户是"出问题了才点重试"的，必须完整自检一次，不能拿上次的标记跳过
+            sForceFullTest = true;
+            startProvisioning("手动重试");
+        });
+        retryButton.setOnLongClickListener(v -> {
+            new AlertDialog.Builder(this)
+                    .setTitle("清空容器重新初始化？")
+                    .setMessage("会删除已下载的 Linux 容器与 Node（约 150MB），"
+                            + "然后重新下载。你的文件、API Key、白名单都不受影响。")
+                    .setPositiveButton("清空并重来", (d, w) -> wipeContainerAndRetry())
+                    .setNegativeButton("取消", null)
+                    .show();
+            return true;
+        });
+        bar.addView(retryButton, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         root.addView(bar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         topBar = bar;
@@ -139,10 +295,134 @@ public class MainActivity extends Activity {
         // 在手机上会把中文挤成一字一行。补丁把它改成整屏的「列表 → 详情」两态。
         // 通过注入实现，不修改容器里 DSH 的任何文件。
         final String mobilePatch = readAssetText("dsh-mobile.js");
+        final String webCompatShim = readAssetText("webview-shim.js");
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                /*
+                 * 兼容垫片必须在页面脚本之前执行。
+                 *
+                 * 原本想用 shouldInterceptRequest 改写主文档（最稳），实测不可行：
+                 * DSH 的本地服务用 **HttpOnly Cookie** 鉴权
+                 * （fetch('/', {credentials:'omit'}) → 401，带凭证 → 200），
+                 * Java 侧复制一份请求拿不到那个 Cookie，主文档直接 401，
+                 * 于是永远注入不进去。
+                 *
+                 * 退而用 onPageStarted：它在主框架导航提交时触发，
+                 * 而 DSH 的 HTML 里内联脚本后面还有 /plugins 的**外链脚本**，
+                 * 注入只要能赶在那些脚本之前就行。
+                 * 是否真的够早由 SIMULATE_OLD_WEBVIEW 的对照实验来验证
+                 * （先删掉 Iterator 再看插件是否报错）。
+                 */
+                /*
+                 * ⚠️ 曾经这里的注入语句在改动中被写成只注入 SIMULATE_OLD_WEBVIEW，
+                 * 把 webCompatShim 漏掉了 —— 垫片实际上从来没进过页面。
+                 * 老 WebView 的 `Iterator is not defined` / `AbortSignal.any is not a function`
+                 * 之所以还在报，就是因为它根本没被注入。
+                 *
+                 * 两个变量必须拼在一起注入：SIMULATE_OLD_WEBVIEW 只是对照实验用的删除器，
+                 * 正式构建里它是空字符串，此时等价于"只注入垫片"。
+                 */
+                StringBuilder inject = new StringBuilder();
+                if (SIMULATE_OLD_WEBVIEW != null) inject.append(SIMULATE_OLD_WEBVIEW);
+                if (webCompatShim != null && !webCompatShim.isEmpty()) {
+                    inject.append('\n').append(webCompatShim);
+                }
+                if (inject.length() > 0) {
+                    view.evaluateJavascript(inject.toString(), null);
+                }
+            }
+
+            @Override
             public void onPageFinished(WebView view, String url) {
+                mark("WebView 页面加载完成");
+                lastPageOkAt = System.currentTimeMillis();
                 if (mobilePatch != null) view.evaluateJavascript(mobilePatch, null);
+                reportWebViewVersion(view);
+            }
+
+            /**
+             * 渲染进程被系统回收 —— 「用久了白屏」的第一大成因。
+             *
+             * <p>必须返回 {@code true}：返回 {@code false}（或不实现）时，
+             * 系统的默认处理是**把整个 App 进程杀掉**。用户看到的就是"用着用着
+             * App 自己没了"；而如果侥幸没被杀，这个 WebView 实例也已经废了 ——
+             * 页面永远是白的，且重开 App 走的只是 onResume（Activity 没重建、
+             * WebView 没换），于是"白屏、进不去"。
+             *
+             * <p>处理方式：把整个 Activity 重建一次（recreate），
+             * 新 Activity 会 new 一个全新的 WebView，随后按正常启动流程加载页面。
+             * 死的那个 WebView 不再碰（碰它没有任何意义）。
+             */
+            @Override
+            public boolean onRenderProcessGone(WebView view,
+                    android.webkit.RenderProcessGoneDetail detail) {
+                boolean crashed = detail != null && detail.didCrash();
+                Log.e(TAG, "WebView 渲染进程没了（didCrash=" + crashed + "）"
+                        + " —— 该 WebView 实例已失效，重建界面");
+                appendReport("  · 界面渲染进程被系统回收（"
+                        + (crashed ? "崩溃" : "为回收内存") + "），正在重建界面…\n");
+
+                long now = System.currentTimeMillis();
+                /*
+                 * 只有"上一次页面加载成功并稳定存活超过 1 分钟"才清零计数。
+                 * 否则"加载完就崩、崩完重建"会被误判成"恢复了"，变成死循环。
+                 */
+                boolean wasHealthy = lastPageOkAt > 0 && now - lastPageOkAt > 60_000L;
+                if (sRendererRecreateFirstAt == 0L
+                        || now - sRendererRecreateFirstAt > 5 * 60 * 1000L
+                        || wasHealthy) {
+                    sRendererRecreateFirstAt = now;
+                    sRendererRecreateCount = 0;
+                }
+                sRendererRecreateCount++;
+
+                if (sRendererRecreateCount > 3) {
+                    /*
+                     * 5 分钟内被回收 3 次以上：说明整机内存真的不够，
+                     * 再重建还是会死。这时不要继续打转 —— 退回日志界面，
+                     * 给用户一个能点的「重试」。
+                     */
+                    Log.e(TAG, "渲染进程反复被回收（" + sRendererRecreateCount + " 次），停止重建");
+                    onProvisionFailed(new IllegalStateException(
+                            "界面渲染进程反复被系统回收（通常是手机内存紧张）。\n"
+                          + "   · 关掉一些后台应用后点右上角「重试」\n"
+                          + "   · 当前界面进程已失效，需要重载一次"));
+                    return true;
+                }
+
+                uiHandler.postDelayed(() -> {
+                    try {
+                        android.widget.Toast.makeText(MainActivity.this,
+                                "界面被系统回收，正在恢复…",
+                                android.widget.Toast.LENGTH_SHORT).show();
+                        recreate();
+                    } catch (Throwable t) {
+                        Log.e(TAG, "recreate 失败", t);
+                    }
+                }, 300);
+                return true;
+            }
+
+            /**
+             * 主框架加载失败（容器还没起来 / 端口没通 / 断网）。
+             *
+             * <p>这里**不弹错**：容器重启期间失败是预期内的，弹窗只会吓人。
+             * 只记日志，并让心跳（地址变了会自动重连）去接管恢复。
+             * 唯一的例外是"地址没变却加载失败"——那多半是容器活着但一时没响应，
+             * 给它一次自动重试（autoReload 自带 30 秒节流）。
+             */
+            @Override
+            public void onReceivedError(WebView view,
+                    android.webkit.WebResourceRequest request,
+                    android.webkit.WebResourceError error) {
+                if (request == null || !request.isForMainFrame()) return;
+                Log.w(TAG, "主框架加载失败: " + request.getUrl()
+                        + " · code=" + (error == null ? -1 : error.getErrorCode())
+                        + " " + (error == null ? "" : error.getDescription()));
+                if (DshService.getUrl() != null) {
+                    autoReload("页面加载失败（容器还在，重试一次）");
+                }
             }
         });
         /*
@@ -167,12 +447,11 @@ public class MainActivity extends Activity {
                 }
                 pendingFileChooser = callback;
                 try {
-                    Intent intent = params.createIntent();
-                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    Intent intent = Attach.buildIntent(params);
                     startActivityForResult(intent, REQ_FILE);
                     return true;
                 } catch (Throwable t) {
-                    Log.w(TAG, "createIntent 失败，退化为任意文件选择", t);
+                    Log.w(TAG, "拉起文件选择器失败，退化为任意文件选择", t);
                 }
                 try {
                     Intent fallback = new Intent(Intent.ACTION_GET_CONTENT);
@@ -189,6 +468,67 @@ public class MainActivity extends Activity {
                             "这台设备上没有可用的文件选择器", android.widget.Toast.LENGTH_LONG).show();
                     return false;
                 }
+            }
+
+            /**
+             * 网页要麦克风（本地语音识别）。
+             *
+             * <p>WebView 里 {@code getUserMedia({audio:true})} 的授权**不走系统权限框**，
+             * 而是先问宿主：这个回调不实现，请求会被**静默拒绝** ——
+             * 网页那边只看到一个 NotFoundError，用户什么都看不到，
+             * 看起来就是"这 App 不支持语音"。
+             *
+             * <p>完整的链路要两步，缺一不可：
+             * <ol>
+             *   <li>清单里声明 RECORD_AUDIO（否则下面第二步连框都弹不出来）；</li>
+             *   <li>这里先要系统权限，拿到之后再 grant 给网页。</li>
+             * </ol>
+             *
+             * <p>只对<b>本机回环</b>上的页面放行：这个 WebView 平时只加载
+             * 127.0.0.1 上的 DSH，但万一里面打开了外部链接，
+             * 也不该把麦克风交给一个陌生站点。
+             */
+            @Override
+            public void onPermissionRequest(final android.webkit.PermissionRequest request) {
+                if (request == null) return;
+                Log.i(TAG, "onPermissionRequest origin=" + request.getOrigin()
+                        + " resources=" + java.util.Arrays.toString(request.getResources())
+                        + " RECORD_AUDIO=" + (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                            == android.content.pm.PackageManager.PERMISSION_GRANTED));
+                if (!isLocalOrigin(request.getOrigin())) {
+                    Log.w(TAG, "拒绝非本机来源的权限请求: " + request.getOrigin());
+                    try { request.deny(); } catch (Throwable ignore) { }
+                    return;
+                }
+                // 网页可能要 audio+video，我们只给 audio（相机没声明，也不打算给）
+                String audio = null;
+                for (String r : request.getResources()) {
+                    if (android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE.equals(r)) audio = r;
+                }
+                if (audio == null) {
+                    try { request.deny(); } catch (Throwable ignore) { }
+                    return;
+                }
+                if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                    try {
+                        request.grant(new String[]{audio});
+                    } catch (Throwable t) {
+                        Log.w(TAG, "grant 麦克风失败", t);
+                        try { request.deny(); } catch (Throwable ignore) { }
+                    }
+                    return;
+                }
+                /*
+                 * 还没授权：把这次网页请求**挂起**，先弹系统权限框，
+                 * 等 onRequestPermissionsResult 回来再答复网页。
+                 * 不能在这里直接 deny —— 那样用户即使马上同意，这一次也已经失败了。
+                 */
+                if (pendingMicRequest != null) {
+                    try { pendingMicRequest.deny(); } catch (Throwable ignore) { }
+                }
+                pendingMicRequest = request;
+                requestPermissions(new String[]{android.Manifest.permission.RECORD_AUDIO}, REQ_MIC);
             }
         });
         // JS 桥：让注入到 DSH 设置页里的「API Key（本机）」入口能打开本 App 的原生设置。
@@ -223,28 +563,401 @@ public class MainActivity extends Activity {
 
         requestStoragePermissions();
         maybePromptApiKey();
-        new Thread(this::runAllTests, "dsh-probe").start();
+        // 桌面图标的组件启用状态和设置对一次账（用户可能清过数据、或升级时被顶回默认）
+        IconSwitcher.reconcile(this);
+        askRegionIfNeeded("首次启动");
+        mark("onCreate 结束（界面已可见）");
     }
 
     /**
-     * 首次启动（还没填过 API Key）直接把设置对话框弹出来。
+     * 首次启动时问一次"你在哪个地区"，用来**选对安装源**。
      *
-     * 分享给别人安装时，"装完就能用"的关键就在这一步：
-     * 没有 Key，用户发的第一条消息必然失败；而入口藏在
-     * DSH 设置 →「API Key（本机）」里，新用户根本不会去找。
-     * 这里主动弹一次，用户可以边等容器下载边填。
+     * <h3>为什么必须有这一步</h3>
+     * 镜像的快慢是有地区性的：大陆走阿里云/中科大是 1 MB/s 级，海外走它们
+     * 常常几十 KB/s 甚至超时；反过来 nodejs.org 在国内也很慢。
+     * 以前顺序是**写死的**国内源优先，于是海外用户装环境屡屡失败 ——
+     * 也就是用户反馈的"非大陆地区难以安装环境"。
+     *
+     * <p>刻意不用"自动测速"来自动判断：测速本身要联网，而用户装环境时
+     * 网络恰恰可能不通，那就变成卡在一个永远完不成的探测上。
+     * 让用户点一下，成本最低也最可控。
+     *
+     * <p>已经装好容器的老用户也会被问一次 —— 这是**故意**的：开关是这版新加的，
+     * 我们无从知道他到底在哪（写死"大陆"正是海外用户装不上的原因）。
+     * 问一次只花一秒，选过之后就不再打扰。
+     */
+    private void askRegionIfNeeded(String trigger) {
+        if (Region.get(this) != null) {
+            startProvisioning(trigger);
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("你在哪个地区？")
+                .setMessage("只用来挑更快的安装源（Linux 容器 / Node / npm 的下载地址）。\n\n"
+                        + "· 中国大陆 → 阿里云 / 中科大镜像\n"
+                        + "· 非中国大陆 → Ubuntu 官方源 / nodejs.org\n\n"
+                        + "选错了不要紧：之后可以在「手机权限 → 环境安装源」里改。")
+                .setCancelable(false)
+                .setPositiveButton("中国大陆", (d, w) -> {
+                    Region.set(this, Region.CN);
+                    appendReport("  [地区] 中国大陆 → 国内镜像\n");
+                    startProvisioning(trigger);
+                })
+                .setNegativeButton("非中国大陆", (d, w) -> {
+                    Region.set(this, Region.GLOBAL);
+                    appendReport("  [地区] 非中国大陆 → 官方源\n");
+                    startProvisioning(trigger);
+                })
+                .show();
+    }
+
+    /**
+     * 首次启动的引导。
+     *
+     * 关键改动：**容器还没装好时不再弹阻塞式对话框**。
+     *
+     * 原来无论装没装好都会在 600ms 弹出 API Key 对话框，用户点「保存并重启 DSH」
+     * 时容器其实还在下载/安装 —— 于是界面被切成"重启中"，
+     * 而 `awaitUrl` 4 分钟超时后没有任何恢复入口，看起来就是"卡死了"。
+     * 现在改成分流：
+     *   · 容器已就绪 → 照旧弹对话框（这里改 Key 最方便）
+     *   · 容器还没装好 → 只在日志区写一行引导，让用户先等安装完成
      */
     private void maybePromptApiKey() {
         String k = DshService.getApiKey(this);
         if (k != null && !k.trim().isEmpty()) return;
-        output.postDelayed(this::showSettingsDialog, 600);
+
+        if (isContainerReady()) {
+            output.postDelayed(this::showSettingsDialog, 600);
+        } else {
+            // 首次运行：把引导写进日志区，别用对话框打断初始化
+            output.postDelayed(() -> {
+                if (isContainerReady()) { showSettingsDialog(); return; }
+                output.append("\n提示：还没填 DeepSeek API Key。"
+                        + "可以现在点右上角「设置」填入，也可以等容器装好后在 DSH 设置里填。\n");
+            }, 800);
+        }
+    }
+
+    /** 容器是否已经装好（有 rootfs + Node + dsh）。 */
+    private boolean isContainerReady() {
+        try {
+            return Env.isInstalled(Env.base(this));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    // ── 初始化耗时显示 ────────────────────────────────────────
+
+    private final android.os.Handler uiHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private volatile long provisionStartedAt = 0L;
+    private final Runnable elapsedTicker = new Runnable() {
+        @Override public void run() {
+            if (provisionStartedAt == 0L) return;
+            long ms = System.currentTimeMillis() - provisionStartedAt;
+            String step = sCurrentStep == null ? "" : sCurrentStep;
+            if (step.length() > 18) step = step.substring(0, 18) + "…";
+            statusBar.setText("DeepSeek Harness · 初始化中 " + fmtDuration(ms)
+                    + (step.isEmpty() ? "" : " · " + step));
+            uiHandler.postDelayed(this, 1000);
+        }
+    };
+
+    private void startElapsedTicker() {
+        provisionStartedAt = System.currentTimeMillis();
+        uiHandler.post(elapsedTicker);
+    }
+
+    private void stopElapsedTicker() {
+        provisionStartedAt = 0L;
+        uiHandler.removeCallbacks(elapsedTicker);
+    }
+
+    // ── 「用久了白屏进不去」的自愈 ────────────────────────────────
+    //
+    // 用户反馈：用久了界面白屏、而且**进不去**（重开 App 也不行）。
+    // 拆开来是三种成因，各自都要兜住 —— 它们的共同点是"没人管就永远是白屏"：
+    //
+    //   ① WebView 的渲染进程被系统回收。用久了必然发生（整机内存紧张时
+    //      系统优先杀渲染进程）。默认结果是**整个 App 被系统杀掉**；
+    //      就算不杀，这个 WebView 实例也已经废了：页面永远是白的，
+    //      而重开 App 走的是 onResume（Activity 没重建、WebView 没换），
+    //      所以用户看到的就是"白屏、进不去"。
+    //      → onRenderProcessGone() 里换一个全新的 WebView（recreate）。
+    //
+    //   ② 容器里的 dsh 进程掉了（被系统清理 / 自己崩）。
+    //      前台服务会把它重新拉起来，但**新地址（token 变了）只写进了
+    //      DshService**，页面还指着旧地址。以前只有 onResume 会去比对地址，
+    //      用户一直停在 App 里就永远等不到那一刻 → 白屏。
+    //      → 心跳：每 5 秒比对一次地址，变了立刻重载（不需要切后台再回来）。
+    //
+    //   ③ 页面自己白屏（前端 SPA 卡死 / 网络断了之后没恢复）。
+    //      → 心跳里顺手用 JS 量一下正文长度，连着几次都空就主动重载一次。
+
+    /** 心跳间隔。5 秒：足够快，又不至于让低频设备费电。 */
+    private static final long RECONNECT_TICK_MS = 5000;
+    /** 两次自动重载之间的最小间隔，防止"重载→还是白→再重载"打转。 */
+    private static final long AUTO_RELOAD_MIN_GAP_MS = 30000;
+    /** 连续几次探测到空白才判定白屏（约 20 秒）。 */
+    private static final int BLANK_TICKS_TO_RELOAD = 4;
+
+    private volatile boolean heartbeatRunning = false;
+    private int blankTicks = 0;
+    private long lastAutoReloadAt = 0L;
+    private boolean containerDownNotified = false;
+    /** 最近一次页面加载完成的时刻（用来判断"刚加载就崩"还是"稳定跑了一阵"）。 */
+    private volatile long lastPageOkAt = 0L;
+
+    /** 渲染进程被回收后重建界面的次数（静态：要跨 Activity 重建累计，否则会打转）。 */
+    private static volatile int sRendererRecreateCount = 0;
+    private static volatile long sRendererRecreateFirstAt = 0L;
+
+    private final Runnable heartbeat = new Runnable() {
+        @Override public void run() {
+            if (!heartbeatRunning) return;
+            try {
+                heartbeatCheck();
+            } catch (Throwable t) {
+                Log.w(TAG, "心跳检查异常", t);
+            }
+            if (heartbeatRunning) uiHandler.postDelayed(this, RECONNECT_TICK_MS);
+        }
+    };
+
+    private void startHeartbeat() {
+        if (heartbeatRunning) return;
+        heartbeatRunning = true;
+        uiHandler.postDelayed(heartbeat, RECONNECT_TICK_MS);
+    }
+
+    private void stopHeartbeat() {
+        heartbeatRunning = false;
+        uiHandler.removeCallbacks(heartbeat);
+    }
+
+    /** 一次心跳：先看容器地址，再看页面内容。 */
+    private void heartbeatCheck() {
+        if (sProvisioning.get()) return;                 // 初始化/重启流程正在跑，别插手
+        String cur = DshService.getUrl();
+        if (cur == null) {
+            /*
+             * 容器不在（dsh 进程已退出，前台服务正在把它拉起来）。
+             * 这时页面上什么都连不上 —— 至少要告诉用户"在自动重启"，
+             * 否则他只会看到白屏，然后去杀 App / 卸载重装。
+             */
+            if (!containerDownNotified) {
+                containerDownNotified = true;
+                Log.i(TAG, "心跳：容器地址为空（dsh 已退出，前台服务正在重启它）");
+                appendReport("  · 容器已停止，正在自动重启（不用管它）\n");
+                android.widget.Toast.makeText(this, "容器已停止，正在自动重启…",
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
+            return;
+        }
+        containerDownNotified = false;
+
+        if (!cur.equals(dshUrl)) {
+            // 地址变了 = 容器被重启过（token 也换了）。这就是"白屏连不上"的主因之一。
+            Log.i(TAG, "心跳：容器地址变化，自动重连\n  旧=" + dshUrl + "\n  新=" + cur);
+            appendReport("  · 心跳发现容器地址变化，自动重连\n");
+            dshUrl = cur;
+            blankTicks = 0;
+            onServerReady(cur);
+            return;
+        }
+        probeBlank();
+    }
+
+    /** 量一下页面正文有多长；连续几次都是空的就认为白屏了。 */
+    private void probeBlank() {
+        if (webView == null || webView.getVisibility() != View.VISIBLE) return;
+        webView.evaluateJavascript(
+                "(function(){try{var b=document.body;"
+              + "if(!b)return 0;"
+              + "return ((b.innerText||'').trim().length);}catch(e){return -1;}})()",
+                value -> {
+                    int len;
+                    try {
+                        len = (int) Double.parseDouble(String.valueOf(value)
+                                .replace("\"", "").trim());
+                    } catch (Throwable t) {
+                        return;                     // 解析不出来就当没测到，别乱重载
+                    }
+                    if (len < 0) return;            // JS 里抛异常了（页面正在换），忽略
+                    if (len > 20) { blankTicks = 0; return; }
+                    blankTicks++;
+                    Log.i(TAG, "心跳：页面正文长度 " + len + "（连续第 " + blankTicks + " 次）");
+                    if (blankTicks >= BLANK_TICKS_TO_RELOAD) {
+                        blankTicks = 0;
+                        autoReload("页面连续 " + (BLANK_TICKS_TO_RELOAD * RECONNECT_TICK_MS / 1000)
+                                + " 秒没有任何内容");
+                    }
+                });
+    }
+
+    /**
+     * 自动重载页面（有节流：30 秒内只做一次）。
+     *
+     * <p>宁可偶尔多刷一次，也不要让用户对着白屏干等 —— 但也不能毫无节制，
+     * 否则真出了持续性的问题会变成"每 5 秒闪一下"，反而更糟。
+     */
+    private void autoReload(String reason) {
+        long now = System.currentTimeMillis();
+        if (now - lastAutoReloadAt < AUTO_RELOAD_MIN_GAP_MS) {
+            Log.i(TAG, "自动重载被节流（距上次不足 "
+                    + (AUTO_RELOAD_MIN_GAP_MS / 1000) + " 秒）：" + reason);
+            return;
+        }
+        lastAutoReloadAt = now;
+        String u = DshService.getUrl();
+        Log.w(TAG, "自动重载 WebView：" + reason + " · url=" + u);
+        appendReport("  · 界面异常（" + reason + "），已自动重载\n");
+        if (webView == null) return;
+        if (u != null) {
+            dshUrl = u;
+            webView.loadUrl(u);
+        } else {
+            webView.reload();
+        }
+    }
+
+    /**
+     * 初始化失败时的统一出口：把"静默卡死"变成"看得见 + 能重试"。
+     */
+    private void onProvisionFailed(Throwable t) {
+        String msg = t == null ? "未知原因"
+                : (t.getClass().getSimpleName()
+                   + (t.getMessage() == null ? "" : ": " + t.getMessage()));
+        sLastFailure = msg;
+        appendReport("  ❌ 初始化失败: " + msg + "\n");
+        Log.e(TAG, "provision failed", t);
+        final boolean dshWasRunning = (dshUrl != null);
+        runOnUiThread(() -> {
+            statusBar.setText("DeepSeek Harness · 初始化失败");
+            // 顶部栏可能已经被 onServerReady 收起来了，这里必须重新亮出来，
+            // 否则「重试」按钮根本点不到。
+            if (topBar != null) {
+                topBar.animate().cancel();
+                topBar.setAlpha(1f);
+                topBar.setVisibility(View.VISIBLE);
+            }
+            if (retryButton != null) retryButton.setVisibility(View.VISIBLE);
+
+            String detail = "\n❌ 初始化失败：" + msg + "\n"
+                    + "   · 常见原因：网络不通 / 容器内 DNS 解析失败 / 存储空间不足\n"
+                    + "   · 点右上角「重试」可以再跑一次（已完成的步骤会自动跳过）\n"
+                    + "   · 长按「重试」可以清空容器重新初始化\n";
+            if (dshWasRunning) {
+                // DSH 本来在跑，别把正在看的界面抢走，给个提示就行
+                android.widget.Toast.makeText(this, "初始化失败：" + msg,
+                        android.widget.Toast.LENGTH_LONG).show();
+            } else {
+                // 还没进过 DSH：把日志区顶上来，让用户看到到底卡在哪一步
+                output.setVisibility(View.VISIBLE);
+                webView.setVisibility(View.GONE);
+                output.append(detail);
+            }
+            appendReport(detail);
+        });
+    }
+
+    /** 让初始化线程自己退出：把最近一次失败原因清掉并复位 UI。 */
+    private void onProvisionStarted() {
+        sLastFailure = null;
+        runOnUiThread(() -> {
+            if (retryButton != null) retryButton.setVisibility(View.GONE);
+            output.setVisibility(View.VISIBLE);
+        });
+    }
+
+    /**
+     * 手机系统返回键：**分层返回**，而不是一下就把整个界面退掉。
+     *
+     * <h3>原来是什么样</h3>
+     * App 没有接管返回键，于是走系统默认 = 结束 MainActivity，
+     * 用户看到的就是"按返回键 App 直接没了"。而手机上正确的行为是
+     * 由内到外一层层退：设置详情 → 设置弹窗 → 图片大图 → 右侧栏 → 左侧抽屉。
+     *
+     * <h3>怎么做的</h3>
+     * 先问页面（注入脚本里的 {@code window.__dshHandleBack}）有没有东西可关；
+     * 它说没有，才走"再按一次退出"。
+     */
+    @Override
+    public void onBackPressed() {
+        if (webView == null) {
+            super.onBackPressed();
+            return;
+        }
+        webView.evaluateJavascript(
+                "(function(){try{return window.__dshHandleBack?window.__dshHandleBack():'false';}"
+                        + "catch(e){return 'false';}})()",
+                value -> {
+                    if (value != null && value.contains("true")) return;   // 页面已经消化掉这次返回
+                    confirmExit();
+                });
+    }
+
+    private long lastBackAt = 0L;
+
+    /** 页面没东西可关时，**再按一次**才真的退出，免得手滑一下就没了。 */
+    private void confirmExit() {
+        long now = System.currentTimeMillis();
+        if (now - lastBackAt < 2000L) {
+            super.onBackPressed();
+            return;
+        }
+        lastBackAt = now;
+        android.widget.Toast.makeText(this, "再按一次返回退出",
+                android.widget.Toast.LENGTH_SHORT).show();
     }
 
     private static final int REQ_STORAGE = 1001;
     private static final int REQ_FILE = 1002;
+    private static final int REQ_MIC = 1003;
 
     /** 等待文件选择结果的 WebView 回调；null 表示当前没有待处理的请求。 */
     private android.webkit.ValueCallback<android.net.Uri[]> pendingFileChooser;
+
+    /** 网页发起的、还没答复的麦克风请求（等系统权限框的结果）。 */
+    private android.webkit.PermissionRequest pendingMicRequest;
+
+    /**
+     * 是不是本机回环上的页面。
+     *
+     * <p>WebView 平时只加载 127.0.0.1 上的 DSH，但页面里可以打开外部链接，
+     * 所以授权前必须确认来源 —— 麦克风不该交给一个陌生站点。
+     * （顺带一提：http://127.0.0.1 在 Chromium 里算**安全上下文**，
+     * 这正是 getUserMedia 能在明文回环上可用的原因。）
+     */
+    private boolean isLocalOrigin(android.net.Uri origin) {
+        if (origin == null) return false;
+        String host = origin.getHost();
+        if (host == null) return false;
+        return "127.0.0.1".equals(host) || "localhost".equals(host) || "::1".equals(host);
+    }
+
+    /** 系统权限框的结果：把挂起的网页请求答复掉，否则网页会一直卡在 pending。 */
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_MIC) return;
+        boolean ok = grantResults != null && grantResults.length > 0
+                && grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        android.webkit.PermissionRequest req = pendingMicRequest;
+        pendingMicRequest = null;
+        if (req == null) return;
+        try {
+            if (ok) {
+                req.grant(new String[]{android.webkit.PermissionRequest.RESOURCE_AUDIO_CAPTURE});
+            } else {
+                req.deny();
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "答复麦克风请求失败", t);
+        }
+    }
 
     /**
      * 接住系统文件管理器返回的选择结果，并交回给 WebView 里的 <input type="file">。
@@ -258,17 +971,28 @@ public class MainActivity extends Activity {
             android.webkit.ValueCallback<android.net.Uri[]> cb = pendingFileChooser;
             pendingFileChooser = null;
             if (cb == null) return;
-            android.net.Uri[] results = null;
-            if (resultCode == RESULT_OK) {
+            /*
+             * 解析 + 兜底 + 拷贝全在 Attach 里。
+             *
+             * 这里曾经只调用一次 parseResult：对文件管理器够用，但**从「相册」选的图片
+             * 会静默丢失**（用户反馈"无法添加图片"）。原因见 Attach 的类注释。
+             * 用户取消时结果仍是 null —— 必须回给 WebView，否则页面会一直等。
+             *
+             * ⚠️ 拷贝要**放到后台线程**：Attach 现在会把选中的内容整个复制一份
+             * （这是绕开"渲染进程读不到"的必要代价），几十 MB 的文件在主线程上拷
+             * 会直接把界面卡住甚至 ANR。回调本身允许在别的线程触发，但为了稳妥，
+             * 回到主线程再交给 WebView。
+             */
+            new Thread(() -> {
+                android.net.Uri[] results = null;
                 try {
-                    results = android.webkit.WebChromeClient.FileChooserParams
-                            .parseResult(resultCode, data);
+                    results = Attach.stageForWebView(this, Attach.collect(this, resultCode, data));
                 } catch (Throwable t) {
-                    Log.w(TAG, "解析文件选择结果失败", t);
+                    Log.w(TAG, "处理文件选择结果失败", t);
                 }
-            }
-            // 用户取消时传 null，页面会收到"没有选择"，不会卡住
-            cb.onReceiveValue(results);
+                final android.net.Uri[] done = results;
+                runOnUiThread(() -> cb.onReceiveValue(done));
+            }, "attach-stage").start();
             return;
         }
         super.onActivityResult(requestCode, resultCode, data);
@@ -291,6 +1015,154 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 初始化入口：**互斥 + 顶层兜底**。
+     *
+     * 原来直接 `new Thread(this::runAllTests)`，有两个问题：
+     *   1. 没有任何互斥 —— 初始化途中切后台再回来（Activity 重建）
+     *      会再起一个线程，两个线程同时解压 rootfs / 装 npm，互相踩踏；
+     *   2. runAllTests 没有顶层 try/catch —— 任何意外异常都会让线程静默死掉，
+     *      界面永久停在一句话上，用户只能卸载重装。
+     * 现在统一从这里进：失败一定会被接住并变成"看得见的错误 + 重试入口"。
+     */
+    private void startProvisioning(String trigger) {
+        if (!sProvisioning.compareAndSet(false, true)) {
+            appendReport("  [跳过] 已有初始化流程在跑（触发源: " + trigger + "）\n");
+            return;
+        }
+        // reportFile 必须先就绪：下面的 appendReport 与看门狗的心跳都会用它，
+        // 而它原本是在 runAllTests() 里才初始化的 —— 首次运行会 NPE。
+        try {
+            File base = new File(getFilesDir(), "probe");
+            //noinspection ResultOfMethodCallIgnored
+            base.mkdirs();
+            if (reportFile == null) reportFile = new File(base, "report.txt");
+            sReportFile = reportFile;
+        } catch (Throwable ignore) { }
+        mark("开始初始化（" + trigger + "）");
+        appendReport("\n--- 开始初始化（触发源: " + trigger + "）---\n");
+        onProvisionStarted();
+        startElapsedTicker();
+        new Thread(() -> {
+            try {
+                runAllTests();
+            } catch (Throwable t) {
+                onProvisionFailed(t);
+            } finally {
+                stopElapsedTicker();
+                sProvisioning.set(false);
+            }
+        }, "dsh-provision").start();
+    }
+
+    /**
+     * 清空容器（rootfs / Node / 半成品归档）后重新初始化。
+     * 对应"解压到一半的 rootfs 救不回来"这种情况。
+     */
+    private void wipeContainerAndRetry() {
+        if (sProvisioning.get()) {
+            android.widget.Toast.makeText(this, "初始化正在进行中，请稍候",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new Thread(() -> {
+            try {
+                File base = Env.base(this);
+                deleteRecursively(new File(base, "rootfs"));
+                deleteRecursively(new File(base, "staticroot"));
+                deleteRecursively(new File(base, "ubuntu-base-arm64.tar.gz"));
+                deleteRecursively(new File(base, "ubuntu-base-arm64.tar.gz.part"));
+                for (File f : new File(base, "opt").listFiles()) {
+                    if (f.getName().startsWith("node-")) deleteRecursively(f);
+                }
+                appendReport("  [重置] 已清空容器，准备重新下载\n");
+            } catch (Throwable t) {
+                Log.w(TAG, "wipe failed", t);
+            }
+            runOnUiThread(() -> {
+                output.setText("已清空容器，正在重新初始化…\n");
+                startProvisioning("清空后重来");
+            });
+        }, "wipe-container").start();
+    }
+
+    private void deleteRecursively(File f) {
+        if (f == null || !f.exists()) return;
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteRecursively(k);
+        //noinspection ResultOfMethodCallIgnored
+        f.delete();
+    }
+
+    /** 手动「重试」时置 true：强制走完整自检，别用上次的标记糊弄过去。 */
+    private volatile boolean sForceFullTest = false;
+
+    /**
+     * 启动 dsh web 并等它就绪。
+     *
+     * 冷启动（跑完 11 项探针）和快速路径共用这一段 —— 抽出来是为了让
+     * "跳过自检"不会连"启动服务"一起跳过。
+     */
+    private String startWebAndWait() {
+        StringBuilder t10 = new StringBuilder();
+        mark("开始启动 dsh web");
+        progress(t10, "  启动前台服务（App 退到后台也能存活）…\n");
+        startDshService();
+        runOnUiThread(() -> statusBar.setText("DeepSeek Harness · 正在启动 dsh web…"));
+        awaitUrl();
+        mark("dsh web 就绪（awaitUrl 返回）");
+        appendReport("Phase 2 · 前台服务启动\n" + t10 + "\n");
+        return t10.append('\n').toString();
+    }
+
+    /** 自检通过的标记文件，内容是本 App 的 versionCode。 */
+    private File verifiedStamp() {
+        return new File(new File(getFilesDir(), "probe"), "verified.stamp");
+    }
+
+    private int appVersionCode() {
+        try {
+            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** 标记存在、且是**当前版本**写下的才算有效。 */
+    private boolean stampValid() {
+        try {
+            File f = verifiedStamp();
+            if (!f.exists()) return false;
+            java.io.BufferedReader br = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(new java.io.FileInputStream(f), "UTF-8"));
+            try {
+                String s = br.readLine();
+                return s != null && s.trim().equals(String.valueOf(appVersionCode()));
+            } finally {
+                br.close();
+            }
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private void markVerified() {
+        try {
+            File f = verifiedStamp();
+            //noinspection ResultOfMethodCallIgnored
+            f.getParentFile().mkdirs();
+            java.io.FileOutputStream os = new java.io.FileOutputStream(f);
+            try {
+                os.write(String.valueOf(appVersionCode()).getBytes("UTF-8"));
+            } finally {
+                os.close();
+            }
+        } catch (Throwable t) {
+            // 写不进去只是"下次还得自检一遍"，不该影响功能
+            Log.w(TAG, "写自检标记失败", t);
+        }
+    }
+
     private void runAllTests() {
         StringBuilder r = new StringBuilder();
         File base = new File(getFilesDir(), "probe");
@@ -306,6 +1178,38 @@ public class MainActivity extends Activity {
                 + "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n"
                 + "device " + Build.MANUFACTURER + " " + Build.MODEL
                 + "  abi=" + Build.SUPPORTED_ABIS[0] + "\n\n");
+
+        /*
+         * ── 快速路径 ────────────────────────────────────────────
+         *
+         * 容器已经装好、而且**上一版 App 的自检已经全过** —— 就别再把下面
+         * 11 项探针从头跑一遍。
+         *
+         * 为什么要有它：这 11 项每一项都要起一次 proot（有的还要起 node），
+         * 而它们全部跑完才会走到 Phase 2 启动 dsh web。
+         * 于是"从点图标到能用"被拉长了十几秒 —— 用户反馈的"初始化时间太长"就是它。
+         * 而这些探针绝大多数是幂等的"确保装好"，已经装好了再验一遍没有意义。
+         *
+         * 两个条件同时成立才跳：容器就绪（rootfs/bash/node/dsh 都在）+
+         * 标记文件里的 versionCode 与当前一致。后者保证**升级 App 后会自动
+         * 完整自检一次**（新版本可能带新的容器侧改动，比如随包插件换版本）。
+         */
+        mark("自检入口");
+        if (!sForceFullTest && isContainerReady() && stampValid()) {
+            mark("走快速路径：跳过 11 项探针");
+            appendReport("  容器已就绪，且自检标记有效 → 跳过 11 项探针，直接启动 dsh web\n");
+            Log.i(TAG, "fast start: 跳过自检");
+            StringBuilder fast = new StringBuilder();
+            fast.append("快速启动（容器已就绪，跳过自检）\n");
+            fast.append(startWebAndWait());
+            final String msg = fast.toString();
+            runOnUiThread(() -> {
+                String cur = output.getText().toString();
+                output.setText(cur.replace("检查中…\n", "") + msg);
+            });
+            return;
+        }
+        sForceFullTest = false;
 
         r.append("TEST 1 · 执行私有目录里的二进制\n");
         String t1 = testExecCopiedBinary(base); r.append(t1).append('\n');
@@ -339,6 +1243,23 @@ public class MainActivity extends Activity {
         appendReport("TEST 7 · Phase 1a 真实 glibc 容器\n" + t7 + "\n");
 
         File rootfs = new File(base, "rootfs");
+        /*
+         * 容器没装好就**到此为止** —— 不再往下跑 TEST 8~11 和 Phase 2。
+         *
+         * 以前不管 TEST 7 的结果继续往下跑，后果是：真正的错误（rootfs 没解压全）
+         * 被后面一连串必然失败淹没 —— 用户截图里只剩下"npm 退出码 1""node 自检失败"，
+         * 方向完全是错的，还要白等好几分钟才看到最后的"初始化失败"。
+         */
+        String rfProblem = rootfsProblem(rootfs);
+        if (rfProblem != null) {
+            final String snapshot = r.toString();
+            appendReport("TEST 8~11 与 Phase 2 已跳过：" + rfProblem + "\n");
+            runOnUiThread(() -> output.setText(output.getText().toString() + snapshot));
+            onProvisionFailed(new IllegalStateException(
+                    "容器没装好（" + rfProblem + "），后续步骤已跳过。"
+                    + "点右上角「重试」会重新下载/解压容器（坏包会自动丢弃）"));
+            return;
+        }
         r.append("TEST 8 · Phase 1b：容器内安装 Node.js\n");
         String t8 = testNode(base, rootfs, libDir, new StringBuilder()); r.append(t8).append('\n');
         appendReport("TEST 8 · 容器内安装 Node.js\n" + t8 + "\n");
@@ -359,13 +1280,9 @@ public class MainActivity extends Activity {
 
         // ── Phase 2：交给前台服务常驻运行，并等待 Web UI 就绪 ──
         r.append("Phase 2 · 启动前台服务并等待 dsh web\n");
-        StringBuilder t10 = new StringBuilder();
-        progress(t10, "  启动前台服务（App 退到后台也能存活）…\n");
-        startDshService();
-        runOnUiThread(() -> statusBar.setText("DeepSeek Harness · 正在启动 dsh web…"));
-        awaitUrl();
-        r.append(t10).append('\n');
-        appendReport("Phase 2 · 前台服务启动\n" + t10 + "\n");
+        r.append(startWebAndWait());
+        // 自检全过 → 记下标记，下次启动直接走快速路径
+        markVerified();
 
         r.append("── 判定 ──\n");
         String verdict = judge(r.toString());
@@ -375,7 +1292,19 @@ public class MainActivity extends Activity {
         Log.i(TAG, "=== RESULT ===\n" + r);
         runOnUiThread(() -> {
             String cur = output.getText().toString();
-            output.setText(cur.replace("检查中…\n", "") + r);
+            if (sLastFailure != null) {
+                /*
+                 * ⚠️ 失败时**只能追加，不能整段替换**。
+                 *
+                 * onProvisionFailed 在 awaitUrl 超时时已经把"为什么失败"写进了日志区，
+                 * 而这里原来是 setText(cur + r) —— 会把那段原因整个擦掉，
+                 * 用户屏幕上就只剩"初始化失败"四个字，看不到任何线索
+                 * （朋友截图里就是这个现象）。
+                 */
+                output.setText(cur + r);
+            } else {
+                output.setText(cur.replace("检查中…\n", "") + r);
+            }
         });
     }
 
@@ -516,6 +1445,54 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             Log.e(TAG, "readAssetText failed: " + name, t);
             return null;
+        }
+    }
+
+    /** 把 InputStream 整个读成字符串（用于改写主文档）。 */
+    private String readStream(InputStream in) throws Exception {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        try {
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+        } finally {
+            try { in.close(); } catch (Throwable ignore) { }
+        }
+        return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 把系统 WebView 的版本记进报告，并统计垫片补了哪些特性。
+     *
+     * 分享出去以后，"老 WebView 装不上"这种问题只能靠用户描述；
+     * 有了这一行，对方只要点「复制日志」就能把确切版本发过来。
+     */
+    private void reportWebViewVersion(WebView view) {
+        try {
+            view.evaluateJavascript(
+                    "(function(){try{var c=window.__dshWebCompat;"
+                  + "return JSON.stringify({ua:navigator.userAgent,"
+                  + "applied:(c&&c.applied)||null});}catch(e){return 'null';}})()",
+                    value -> {
+                        if (value == null || value.equals("null")) return;
+                        // evaluateJavascript 返回的是 JSON 字符串字面量，去引号并反转义
+                        String s = value;
+                        if (s.length() > 1 && s.charAt(0) == '"') {
+                            s = s.substring(1, s.length() - 1).replace("\\\"", "\"").replace("\\\\", "\\");
+                        }
+                        String ver = "?";
+                        java.util.regex.Matcher m = java.util.regex.Pattern
+                                .compile("Chrome/([0-9.]+)").matcher(s);
+                        if (m.find()) ver = m.group(1);
+                        String applied = "";
+                        int i = s.indexOf("applied\":");
+                        if (i >= 0) applied = s.substring(i + 9, Math.min(i + 200, s.length()));
+                        webViewVersion = ver;
+                        appendReport("  [WebView] Chrome/" + ver + " · 垫片补充: " + applied + "\n");
+                        Log.i(TAG, "WebView Chrome/" + ver + " shim=" + applied);
+                    });
+        } catch (Throwable t) {
+            Log.w(TAG, "reportWebViewVersion failed", t);
         }
     }
 
@@ -696,45 +1673,86 @@ public class MainActivity extends Activity {
     //
     // 这里下载 Ubuntu base 24.04 arm64（官方最小 glibc rootfs，28.6 MB），
     // 解压到本 App 沙箱，然后用 proot 在里面跑 bash。这一步能彻底定论 proot 机制。
-    private static final String[] ROOTFS_URLS = {
-            // 阿里云镜像实测 1.04 MB/s，官方源 0.20 MB/s，所以国内源优先
-            "https://mirrors.aliyun.com/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-arm64.tar.gz",
-            "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-arm64.tar.gz"
-    };
-
+    //
+    // ⚠️ 下载源**不在这里写死**了 —— 见 {@link Region}：
+    // 海外用户走国内源会慢到失败（用户反馈"非大陆地区难以安装环境"），
+    // 现在按用户在首次启动时选的地区排优先顺序。
     private String testContainer(File base, String libDir) {
         StringBuilder sb = new StringBuilder();
         try {
             File proot = new File(base, "proot");
             File rootfs = new File(base, "rootfs");
-            File bash = new File(rootfs, "usr/bin/bash");
+            File archive = new File(base, "ubuntu-base-arm64.tar.gz");
 
-            if (!(bash.exists() && bash.length() > 0)) {
-                File archive = new File(base, "ubuntu-base-arm64.tar.gz");
-                if (!(archive.exists() && archive.length() > 20_000_000L)) {
-                    boolean downloaded = false;
-                    for (String url : ROOTFS_URLS) {
-                        try {
-                            progress(sb, "  下载 rootfs: " + url + "\n");
-                            download(url, archive);
-                            downloaded = true;
-                            break;
-                        } catch (Throwable t) {
-                            progress(sb, "  该源失败: " + t.getClass().getSimpleName() + ": " + t.getMessage() + "\n");
-                        }
-                    }
-                    if (!downloaded) return sb + "  结果 : ❌ FAIL — rootfs 下载失败（三个源都不通）\n";
-                }
-                progress(sb, "  下载完成 (" + (archive.length() / 1048576) + " MB)，开始解压（约 120MB，1-3 分钟）…\n");
-                extractTarGz(archive, rootfs);
-                progress(sb, "  解压完成\n");
+            progress(sb, "  可用空间: " + mb(freeBytes(base)) + " MB\n");
+            String space = spaceProblem(base, ROOTFS_STAGE_BYTES);
+            if (space != null) return fail(sb, space);
+
+            /*
+             * 【自愈】已经存在的 rootfs 先验完整性，坏的直接连归档一起丢掉重来。
+             *
+             * 这是"环境装不上、点重试也没用"的根治点。原来的判断只有
+             * `/usr/bin/bash 存在吗` —— 而用户机器上正是 bash 在、`/usr/bin/env` 不在
+             * （归档按字母序解压，bash 排在 env 前面：下载被截断或存储不足时
+             * 就恰好停在这一段）。于是每次重试都认定"rootfs 已存在、跳过下载解压"，
+             * 然后 Node/npm 必然全崩，用户看到的就是那屏指向错误方向的日志。
+             */
+            String problem = rootfsProblem(rootfs);
+            if (problem != null && new File(rootfs, "usr/bin/bash").exists()) {
+                progress(sb, "  ⚠️ 已存在的 rootfs 不完整（" + problem + "）→ 丢掉重下\n");
+            }
+            if (problem != null) {
+                deleteRecursively(rootfs);
+                deleteRecursively(archive);
+                deleteRecursively(new File(archive.getAbsolutePath() + ".part"));
+            }
+
+            boolean ready = rootfsProblem(rootfs) == null;
+            if (ready) {
+                sb.append("  rootfs 已存在，且完整性校验通过 → 跳过下载解压\n");
             } else {
-                sb.append("  rootfs 已存在，跳过下载解压\n");
+                /*
+                 * 先试本地已下载的归档：如果上次失败在"解压"这一步（比如空间不够），
+                 * 归档还是好的，能省一次 30MB 下载。校验不过就删掉，别留着反复解。
+                 */
+                if (archive.exists() && archive.length() >= ROOTFS_MIN_BYTES) {
+                    progress(sb, "  先试本地已下载的归档（"
+                            + (archive.length() / 1048576) + " MB）…\n");
+                    ready = tryExtractRootfs(archive, rootfs, sb);
+                    if (!ready) deleteRecursively(archive);
+                }
+                String[] urls = Region.rootfsUrls(this);
+                for (int i = 0; i < urls.length && !ready; i++) {
+                    String url = urls[i];
+                    try {
+                        progress(sb, "  下载 rootfs（源 " + (i + 1) + "/" + urls.length + "）: "
+                                + url + "\n");
+                        download(url, archive, ROOTFS_MIN_BYTES);
+                        progress(sb, "  下载完成 (" + (archive.length() / 1048576)
+                                + " MB)，开始解压（约 120MB，1-3 分钟）…\n");
+                        ready = tryExtractRootfs(archive, rootfs, sb);
+                        if (!ready) {
+                            // 归档与解压结果都不可信，删干净再换下一个源
+                            deleteRecursively(archive);
+                        }
+                    } catch (Throwable t) {
+                        progress(sb, "  该源失败: " + t.getClass().getSimpleName()
+                                + ": " + t.getMessage() + "\n");
+                        deleteRecursively(new File(archive.getAbsolutePath() + ".part"));
+                        deleteRecursively(archive);
+                    }
+                }
+                if (!ready) {
+                    return fail(sb, "rootfs 下载/解压失败（" + urls.length
+                            + " 个源都不行，或解压后文件不全）");
+                }
             }
 
-            if (!(bash.exists() && bash.length() > 0)) {
-                return sb + "  结果 : ❌ FAIL — 解压后找不到 /usr/bin/bash\n";
-            }
+            // 顺手把容器里的 apt 源改成所选地区的镜像（大陆用户之后 apt 才不至于龟速）
+            Region.applyAptSources(this, rootfs);
+            // 容器内的 npm/pnpm 默认源同理：装插件、升级内核都会用到它
+            Region.applyNpmrc(this, rootfs);
+            progress(sb, "  容器安装源已按地区设置：" + Region.label(this) + "\n");
 
             // proot 需要的 guest 挂载点
             for (String d : new String[]{"dev", "proc", "sys", "tmp"}) {
@@ -772,8 +1790,133 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 下载（支持重定向、断点产物、进度写报告）。 */
+    // ── rootfs 完整性校验 / 存储空间预检 ────────────────────────
+
+    /**
+     * rootfs 解压完整性的**哨兵文件**。
+     *
+     * <p>为什么不能只看 /usr/bin/bash：用户反馈的"环境装不上"里，proot 报的是
+     * `'/usr/bin/env' not found`，而 bash 在。原因是归档按**字母序**解压，
+     * `usr/bin/bash` 排在 `usr/bin/env` 前面 —— 下载被截断、或者存储空间不足
+     * 中途失败，都会恰好停在这一段。只看 bash 就判定"装好了"，于是后面
+     * Node/npm/自检必然全崩，用户看到的那屏日志（npm 退出码 1、node 自检失败）
+     * 指向的方向完全是错的，白等好几分钟。
+     *
+     * <p>所以多验几个关键点：解释器入口 env、merged-/usr 的 /bin/sh 符号链接
+     * （它同时验证了符号链接有没有被正确还原）、glibc、apt、以及 os-release。
+     */
+    private static final String[] ROOTFS_SENTINELS = {
+            "usr/bin/env", "usr/bin/bash", "bin/sh", "etc/os-release",
+            "usr/lib/aarch64-linux-gnu/libc.so.6", "usr/bin/apt-get"
+    };
+
+    /*
+     * 空间门槛刻意取**下限**而不是"宽裕值"：这两个数是用来拦住
+     * "装到一半没空间"的，不是用来劝退空间刚好够用的手机。
+     * 拿不准的时候宁可放过（让它去试）也不要误拦 —— 拦住一个本来能装成功的用户，
+     * 比让一个空间不足的用户失败一次更糟。
+     */
+    /** rootfs 这一步要的空间（归档 30MB + 解压约 150MB + 余量）。 */
+    private static final long ROOTFS_STAGE_BYTES = 300L * 1024 * 1024;
+    /** 装完整个环境的下限（rootfs + Node 约 120MB + npm 依赖；装完实测在 600MB 上下）。 */
+    private static final long TOTAL_STAGE_BYTES = 700L * 1024 * 1024;
+    /** 归档最小可信体积：归档是 29,936,675 字节，明显小于它就是下载被截断了。 */
+    private static final long ROOTFS_MIN_BYTES = 25L * 1024 * 1024;
+    private static final long NODE_MIN_BYTES = 40L * 1024 * 1024;
+
+    /** 返回 null 表示完整；否则返回"缺了什么"（直接给用户看）。 */
+    private static String rootfsProblem(File rootfs) {
+        for (String s : ROOTFS_SENTINELS) {
+            if (!new File(rootfs, s).exists()) return "缺少 /" + s;
+        }
+        return null;
+    }
+
+    /**
+     * 解压 + 校验，二合一。
+     *
+     * <p>校验不通过就把半成品删掉再返回 false —— 留着它只会让下一次重试
+     * 继续误判"已经装好了"。返回 true 表示解压且校验都通过。
+     */
+    private boolean tryExtractRootfs(File archive, File rootfs, StringBuilder sb) {
+        try {
+            // 先清空：半个包叠在旧目录上会混出"看起来有、其实不全"的 rootfs
+            deleteRecursively(rootfs);
+            //noinspection ResultOfMethodCallIgnored
+            rootfs.mkdirs();
+            extractTarGz(archive, rootfs);
+            String p = rootfsProblem(rootfs);
+            if (p == null) {
+                progress(sb, "  解压完成，完整性校验通过\n");
+                return true;
+            }
+            progress(sb, "  ❌ 解压后完整性校验不过（" + p + "）\n");
+        } catch (Throwable t) {
+            progress(sb, "  ❌ 解压失败: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage() + "\n");
+        }
+        deleteRecursively(rootfs);
+        return false;
+    }
+
+    /** 失败时的统一出口：记下原因（失败界面会把它显示出来）并返回日志行。 */
+    private String fail(StringBuilder sb, String why) {
+        sLastFailure = why;
+        return sb + "  结果 : ❌ FAIL — " + why + "\n";
+    }
+
+    /** 可用空间（字节）；问不出来返回 -1。 */
+    private static long freeBytes(File dir) {
+        try {
+            return new android.os.StatFs(dir.getAbsolutePath()).getAvailableBytes();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private static long mb(long bytes) {
+        return bytes < 0 ? -1 : bytes / 1048576;
+    }
+
+    /**
+     * 返回 null = 空间够；否则是一句**带具体数字**的话。
+     *
+     * <p>原来完全没有空间检查，于是"存储不足"这类失败会伪装成
+     * 下载失败 / npm 失败，用户永远猜不到该去清空间。
+     */
+    private static String spaceProblem(File dir, long need) {
+        long free = freeBytes(dir);
+        if (free < 0) return null;                       // 问不出来就别拦
+        if (free >= need) return null;
+        return "存储空间不足：可用 " + mb(free) + " MB，至少需要 " + mb(need)
+                + " MB。请先清理手机空间，再点右上角「重试」";
+    }
+
+    /** 下载（不校验体积，只有确实不知道大小时才用）。 */
     private void download(String urlStr, File dst) throws Exception {
+        download(urlStr, dst, 0L);
+    }
+
+    /**
+     * 下载文件，带**总时长上限 + 停滞检测 + 界面进度 + 完整性校验**。
+     *
+     * <p>原来的版本只有 per-read 的 60 秒超时，没有任何总时长限制，
+     * 而且进度只写进报告文件（普通用户看不到）—— 于是"下载中"和"卡死"
+     * 在界面上长得一模一样。现在：
+     *   · 连续 {@link #DOWNLOAD_STALL_MS} 没有任何字节 → 判定停滞，中止并换源；
+     *   · 总时长超过 {@link #DOWNLOAD_TIMEOUT_MS} → 中止；
+     *   · 每 2MB 往界面上打一行进度，让用户看到数字在动。
+     *
+     * <p>【为什么还要校验字节数】原来读完流就重命名成正式文件，
+     * 连拿到的 Content-Length 都**从不比对**。于是"服务器/代理中途把连接关了"
+     * 这种最常见的截断会被当成下载成功：一个 25MB 的半截 tar.gz
+     * 能满足原来的 `> 20MB` 检查，解压到一半停住 ——
+     * 这就是用户反馈的"环境装不上、点重试也没用"的其中一条根因。现在：
+     *   · 服务器给了 Content-Length → 必须一个字节不差；
+     *   · 没给 → 至少不能小于 minBytes（调用方按已知体积给）；
+     *   · 任何中途异常都删掉 .part，绝不留半截文件给下一次误判。
+     */
+    private void download(String urlStr, File dst, long minBytes) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
         c.setConnectTimeout(20000);
         c.setReadTimeout(60000);
@@ -787,6 +1930,8 @@ public class MainActivity extends Activity {
         long total = c.getContentLengthLong();
         File tmp = new File(dst.getAbsolutePath() + ".part");
         long got = 0, lastReported = 0;
+        final long startedAt = System.currentTimeMillis();
+        long lastByteAt = startedAt;
         try (InputStream in = new BufferedInputStream(c.getInputStream(), 1 << 16);
              OutputStream os = new FileOutputStream(tmp)) {
             byte[] buf = new byte[1 << 16];
@@ -794,13 +1939,54 @@ public class MainActivity extends Activity {
             while ((n = in.read(buf)) > 0) {
                 os.write(buf, 0, n);
                 got += n;
-                if (got - lastReported >= (4L << 20)) {
+                long now = System.currentTimeMillis();
+
+                // 先用**上一次收到数据的时间**判断停滞，再更新它
+                if (now - lastByteAt > DOWNLOAD_STALL_MS) {
+                    throw new IOException("下载停滞（" + (DOWNLOAD_STALL_MS / 1000) + " 秒无数据）");
+                }
+                lastByteAt = now;
+                sLastOutputAt = now;
+
+                if (now - startedAt > DOWNLOAD_TIMEOUT_MS) {
+                    throw new IOException("下载超时（总时长超过 "
+                            + (DOWNLOAD_TIMEOUT_MS / 60000) + " 分钟）");
+                }
+                if (got - lastReported >= (2L << 20)) {
                     lastReported = got;
-                    appendReport("    进度 " + (got >> 20) + " / " + (total >> 20) + " MB\n");
+                    String line = "    下载中 " + (got >> 20) + " / "
+                            + (total > 0 ? (total >> 20) + " MB" : "? MB")
+                            + "（已 " + fmtDuration(now - startedAt) + "）\n";
+                    appendReport("  " + line);
+                    final String l = "  " + line;
+                    runOnUiThread(() -> output.append(l));
                 }
             }
+        } catch (Throwable t) {
+            /*
+             * 半截文件绝不能留下。
+             *
+             * 下载失败时如果把 .part 留着（原来就是），下一次运行会把它
+             * 当成"已经下载好的归档"直接拿去解压 —— 坏包被反复使用，
+             * 用户看到的就是"点重试也没用"。
+             */
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            throw t;
         } finally {
             c.disconnect();
+        }
+        if (total > 0 && got != total) {
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            throw new IOException("下载不完整（收到 " + got + " / 应为 " + total
+                    + " 字节）—— 已丢弃，换源重试");
+        }
+        if (minBytes > 0 && got < minBytes) {
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            throw new IOException("下载的文件偏小（" + got + " 字节 < " + minBytes
+                    + "）—— 已丢弃，换源重试");
         }
         if (!tmp.renameTo(dst)) {
             copy(tmp, dst);
@@ -857,45 +2043,55 @@ public class MainActivity extends Activity {
         appendReport("  解包统计: 文件 " + files + " 个, 链接 " + links + " 个\n");
     }
 
-    /** 同时写入报告文件与界面（界面更新需回主线程）。 */
+    /** 同时写入报告文件与界面（界面更新需回主线程）。**只在初始化主线程调用**。 */
     private void progress(StringBuilder sb, String line) {
         sb.append(line);
-        appendReport(line);
-        final String l = line;
-        runOnUiThread(() -> output.append(l));
+        String t = line.trim();
+        if (!t.isEmpty()) sCurrentStep = t;     // 供状态栏的"耗时 + 当前步骤"显示
+        liveProgress(line);
     }
 
     // ── TEST 8 / TEST 9 · Phase 1b：Node + DSH ─────────────────
-    private static final String NODE_VERSION = "v22.23.2";
-    private static final String NODE_DIR = "node-" + NODE_VERSION + "-linux-arm64";
-    private static final String[] NODE_URLS = {
-            // npmmirror（阿里）国内最快；其次清华；最后官方
-            "https://registry.npmmirror.com/-/binary/node/" + NODE_VERSION + "/" + NODE_DIR + ".tar.gz",
-            "https://mirrors.tuna.tsinghua.edu.cn/nodejs-release/" + NODE_VERSION + "/" + NODE_DIR + ".tar.gz",
-            "https://nodejs.org/dist/" + NODE_VERSION + "/" + NODE_DIR + ".tar.gz"
-    };
+    //
+    // 包级可见（去掉 private）是给 {@link Region} 用的：Node 的下载源要按地区排序。
+    static final String NODE_VERSION = "v22.23.2";
+    static final String NODE_DIR = "node-" + NODE_VERSION + "-linux-arm64";
 
     /** TEST 8：在容器里装上 Node.js（官方 arm64 glibc 构建）。 */
     private String testNode(File base, File rootfs, String libDir, StringBuilder sb) {
         try {
             File nodeBin = new File(rootfs, "opt/" + NODE_DIR + "/bin/node");
             if (!(nodeBin.exists() && nodeBin.length() > 0)) {
+                String space = spaceProblem(base, TOTAL_STAGE_BYTES);
+                if (space != null) return fail(sb, space);
+
                 File archive = new File(base, NODE_DIR + ".tar.gz");
-                if (!(archive.exists() && archive.length() > 10_000_000L)) {
+                // 体积不对的归档直接丢掉：半截包解出来的 Node 是坏的
+                if (archive.exists() && archive.length() < NODE_MIN_BYTES) {
+                    progress(sb, "  ⚠️ 本地 Node 归档偏小（" + archive.length()
+                            + " 字节）→ 丢掉重下\n");
+                    deleteRecursively(archive);
+                }
+                if (!(archive.exists() && archive.length() >= NODE_MIN_BYTES)) {
+                    String[] urls = Region.nodeUrls(this);
                     boolean ok = false;
-                    for (String url : NODE_URLS) {
+                    for (int i = 0; i < urls.length && !ok; i++) {
                         try {
-                            progress(sb, "  下载 Node: " + url + "\n");
-                            download(url, archive);
+                            progress(sb, "  下载 Node（源 " + (i + 1) + "/" + urls.length + "）: "
+                                    + urls[i] + "\n");
+                            download(urls[i], archive, NODE_MIN_BYTES);
                             ok = true;
-                            break;
                         } catch (Throwable t) {
                             progress(sb, "  该源失败: " + t.getMessage() + "\n");
+                            deleteRecursively(new File(archive.getAbsolutePath() + ".part"));
+                            deleteRecursively(archive);
                         }
                     }
-                    if (!ok) return sb + "  结果 : ❌ FAIL — Node 下载失败\n";
+                    if (!ok) return fail(sb, "Node 下载失败（" + urls.length + " 个源都不行）");
                 }
                 progress(sb, "  解压 Node 到容器 /opt …\n");
+                // 先清掉可能存在的半个 Node，再解压（否则会混出"有 bin/node 但缺库"的目录）
+                deleteRecursively(new File(rootfs, "opt/" + NODE_DIR));
                 extractTarGz(archive, new File(rootfs, "opt"));
             } else {
                 sb.append("  Node 已存在，跳过\n");
@@ -911,6 +2107,15 @@ public class MainActivity extends Activity {
             boolean ok = res.contains(NODE_VERSION);
             sb.append("  输出 : ").append(oneLine(res)).append('\n');
             sb.append("  结果 : ").append(ok ? "✅ PASS — Node 在容器内可运行" : "❌ FAIL").append('\n');
+            if (!ok) {
+                /*
+                 * 解压出来的 Node 跑不起来 → 把它和归档一起丢掉。
+                 * 不丢的话下一次重试看到 bin/node 存在就"跳过"，永远好不了。
+                 */
+                deleteRecursively(new File(rootfs, "opt/" + NODE_DIR));
+                deleteRecursively(new File(base, NODE_DIR + ".tar.gz"));
+                return fail(sb, "Node 解压后在容器里跑不起来（已丢弃，下次重试会重新下载）");
+            }
             return sb.toString();
         } catch (Throwable t) {
             Log.e(TAG, "test8 failed", t);
@@ -924,30 +2129,100 @@ public class MainActivity extends Activity {
             File dshBin = new File(rootfs, "opt/" + NODE_DIR + "/bin/dsh");
             if (!(dshBin.exists())) {
                 // 容器内 DNS：Ubuntu base 的 /etc/resolv.conf 是空的，glibc 无法解析域名。
-                // 写入公共 DNS（阿里 + DNSPod + Google 兜底）。
+                // 第一顺位按**地区**选（大陆走阿里 DNS，海外走 Google/Cloudflare），后面几个兜底。
                 File resolv = new File(rootfs, "etc/resolv.conf");
                 try (OutputStream os = new FileOutputStream(resolv)) {
-                    os.write("nameserver 223.5.5.5\nnameserver 119.29.29.29\nnameserver 8.8.8.8\n"
-                            .getBytes(StandardCharsets.UTF_8));
+                    os.write(Region.resolvConf(this).getBytes(StandardCharsets.UTF_8));
                 }
-                progress(sb, "  已写入容器 resolv.conf（223.5.5.5 / 119.29.29.29）\n");
+                progress(sb, "  已写入容器 resolv.conf（按地区: " + Region.label(this) + "）\n");
+
+                String space = spaceProblem(base, TOTAL_STAGE_BYTES);
+                if (space != null) return fail(sb, space);
 
                 String nodePath = "/opt/" + NODE_DIR + "/bin";
                 progress(sb, "  npm install -g @deepseek-ai/dsh（包较多，可能 5-15 分钟，请勿锁屏）…\n");
-                // 流式执行：输出实时写入报告，便于 PC 侧轮询进度
-                int code = execStreaming(new String[]{
-                        new File(base, "proot").getAbsolutePath(),
-                        "-r", rootfs.getAbsolutePath(), "-0", "-w", "/root",
-                        "-b", "/dev", "-b", "/proc", "-b", "/sys",
-                        "/usr/bin/env", "-i",
-                        "HOME=/root",
-                        "PATH=" + nodePath + ":/usr/local/bin:/usr/bin:/bin",
-                        "npm_config_registry=https://registry.npmmirror.com",
-                        "npm_config_cache=/root/.npm",
-                        "npm_config_update_notifier=false",
-                        nodePath + "/npm", "install", "-g", "@deepseek-ai/dsh",
-                        "--no-audit", "--no-fund", "--loglevel=http"}, libDir, sb);
-                progress(sb, "  npm 退出码: " + code + "\n");
+
+                /*
+                 * npm 失败时**必须能看到它自己说了什么**。
+                 *
+                 * 实测有用户的手机上 npm 直接以退出码 217 失败（一个不常见的码），
+                 * 而没有 npm 的输出就无从判断是网络、缓存损坏、还是 Node 本身有问题。
+                 * 这里：最多试 3 次（每次之间清掉 npm 缓存与半成品），
+                 * 换一次官方源；都失败就把 npm 最后几十行原样显示出来。
+                 */
+                int code = -1;
+                boolean ok = false;
+                for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+                    if (attempt > 1) {
+                        progress(sb, "  ⚠️ 第 " + (attempt - 1) + " 次失败（退出码 " + code
+                                + "），清理缓存后重试…\n");
+                        deleteRecursively(new File(rootfs, "root/.npm"));
+                        deleteRecursively(new File(rootfs,
+                                "opt/" + NODE_DIR + "/lib/node_modules/@deepseek-ai"));
+                    }
+                    /*
+                     * 主源按地区选（大陆 = npmmirror，海外 = npmjs.org），
+                     * 第 3 次强制换成另一个 —— 镜像偶发缺包/损坏时这是唯一的出路。
+                     */
+                    String[] regs = Region.npmRegistries(this);
+                    String registry = TEMP_BROKEN_REGISTRY != null ? TEMP_BROKEN_REGISTRY
+                            : (attempt >= 3 ? regs[1] : regs[0]);
+                    try {
+                        code = execStreaming(new String[]{
+                                new File(base, "proot").getAbsolutePath(),
+                                "-r", rootfs.getAbsolutePath(), "-0", "-w", "/root",
+                                "-b", "/dev", "-b", "/proc", "-b", "/sys",
+                                "/usr/bin/env", "-i",
+                                "HOME=/root",
+                                "PATH=" + nodePath + ":/usr/local/bin:/usr/bin:/bin",
+                                "npm_config_registry=" + registry,
+                                "npm_config_cache=/root/.npm",
+                                "npm_config_fetch_timeout=60000",
+                                "npm_config_fetch_retries=3",
+                                "npm_config_update_notifier=false",
+                                nodePath + "/npm", "install", "-g", "@deepseek-ai/dsh",
+                                "--no-audit", "--no-fund", "--loglevel=http"},
+                                libDir, sb, NPM_TIMEOUT_MS, NPM_IDLE_MS);
+                    } catch (java.util.concurrent.TimeoutException te) {
+                        progress(sb, "  ❌ npm 卡死，已中止：" + te.getMessage() + "\n");
+                        progress(sb, "     常见原因：容器内 DNS 不通 / 网络被限制。可以点右上角「重试」重来。\n");
+                        return sb + "  结果 : ❌ FAIL — npm install 卡死（" + te.getMessage() + "）\n";
+                    }
+                    progress(sb, "  npm 退出码: " + code + "（源: " + registry + "）\n");
+                    ok = dshBin.exists();
+                }
+
+                if (!ok) {
+                    /*
+                     * 把 npm 的真实输出摊开 —— 这是唯一能定位 217 这种东西的办法。
+                     * 同时跑一个最小的 node 自检：如果连 `node -e` 都起不来，
+                     * 那就是这台手机的 Node 有问题，而不是 npm / 网络。
+                     */
+                    progress(sb, "  ── npm 最后输出 ──\n" + execTailText() + "\n");
+                    String nodeCheck;
+                    try {
+                        nodeCheck = oneLine(exec(new String[]{
+                                new File(base, "proot").getAbsolutePath(),
+                                "-r", rootfs.getAbsolutePath(), "-0", "-w", "/root",
+                                "-b", "/dev", "-b", "/proc", "-b", "/sys",
+                                "/usr/bin/env", "-i", "HOME=/root",
+                                "PATH=" + nodePath + ":/usr/local/bin:/usr/bin:/bin",
+                                nodePath + "/node", "-e",
+                                "console.log('NODE_OK', process.version, process.arch)"},
+                                libDir));
+                    } catch (Throwable t) {
+                        nodeCheck = "自检失败: " + t;
+                    }
+                    progress(sb, "  ── node 自检 ──\n    " + nodeCheck + "\n");
+                    StringBuilder hint = new StringBuilder();
+                    if (!nodeCheck.contains("NODE_OK")) {
+                        hint.append("     · 连 `node -e` 都跑不起来 → 这台手机的容器里 Node 无法运行\n");
+                    } else {
+                        hint.append("     · Node 本身正常 → 问题在 npm 下载/解包（网络或镜像）\n");
+                    }
+                    hint.append("     · 可以点右上角「重试」；长按「重试」可清空容器完全重来\n");
+                    progress(sb, hint.toString());
+                }
             } else {
                 sb.append("  dsh 已安装，跳过 npm install\n");
             }
@@ -994,20 +2269,102 @@ public class MainActivity extends Activity {
 
     /** 边跑边把输出写进报告（长时间命令用，便于 PC 侧轮询进度）。 */
     private int execStreaming(String[] cmd, String ldLibraryPath, StringBuilder sb) throws Exception {
+        return execStreaming(cmd, ldLibraryPath, sb, EXEC_TIMEOUT_MS, EXEC_IDLE_MS);
+    }
+
+    /**
+     * 边跑边把输出写进报告与界面，并带**超时保护 + 心跳**。
+     *
+     * 为什么必须有超时（这是"首次使用卡在『正在重启容器内的 DSH…』"的元凶）：
+     * 首次初始化最重的一步是容器内的 `npm install -g @deepseek-ai/dsh`，
+     * 它依赖容器里的 DNS 与外网。这条命令原来**完全没有超时** ——
+     * DNS / registry 一旦不通，`readLine()` 永远等不到 EOF，
+     * 整个初始化线程永久挂住，界面就停在最后一句话上再也不动。
+     *
+     * 现在：总时长超过 timeoutMs，或连续 idleMs 没有任何输出 →
+     * 杀掉进程 + 清理容器残留，并抛 TimeoutException 让上层报错、允许重试。
+     * 同时每 15 秒打一行心跳，让用户看得出"还在动"。
+     */
+    private int execStreaming(String[] cmd, String ldLibraryPath, StringBuilder sb,
+                              long timeoutMs, long idleMs) throws Exception {
         ProcessBuilder pb = buildProcess(cmd, ldLibraryPath);
-        Process p = pb.start();
+        final Process p = pb.start();
+        final long startedAt = System.currentTimeMillis();
+        sLastOutputAt = startedAt;
+        final boolean[] timedOut = {false};
+        final String[] why = {""};
+
+        Thread watchdog = new Thread(() -> {
+            long lastBeat = System.currentTimeMillis();
+            try {
+                while (p.isAlive()) {
+                    Thread.sleep(2000);
+                    long now = System.currentTimeMillis();
+                    long total = now - startedAt;
+                    long idle = now - sLastOutputAt;
+                    if (total > timeoutMs || idle > idleMs) {
+                        timedOut[0] = true;
+                        why[0] = total > timeoutMs
+                                ? "总时长超过 " + (timeoutMs / 60000) + " 分钟"
+                                : "已有 " + (idle / 1000) + " 秒没有任何输出";
+                        liveProgress("  ⏱ 判定卡死（" + why[0] + "），正在强制终止…\n");
+                        p.destroy();
+                        Env.killStaleDsh(Env.base(MainActivity.this));
+                        return;
+                    }
+                    if (now - lastBeat >= HEARTBEAT_MS) {
+                        lastBeat = now;
+                        liveProgress("  … 仍在进行（已 " + fmtDuration(total) + "）\n");
+                    }
+                }
+            } catch (InterruptedException ignore) {
+                // 正常结束（主线程会 interrupt 看门狗）
+            } catch (Throwable t) {
+                Log.w(TAG, "watchdog error", t);
+            }
+        }, "exec-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+
         try (BufferedReader br = new BufferedReader(
                 new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             int n = 0;
             while ((line = br.readLine()) != null) {
+                sLastOutputAt = System.currentTimeMillis();
                 n++;
                 if (n <= 400 || n % 20 == 0) {        // 限制写入量，避免报告爆炸
                     appendReport("    | " + line + "\n");
                 }
+                // 保留最后若干行 —— 失败时要把它原样摊给用户看
+                synchronized (sExecTail) {
+                    sExecTail.addLast(line);
+                    while (sExecTail.size() > EXEC_TAIL_MAX) sExecTail.removeFirst();
+                }
+                // 像报错的行实时显示到界面上，否则用户只能干等
+                if (looksLikeErrorLine(line)) {
+                    liveProgress("    ↳ " + line + "\n");
+                }
             }
+        } catch (Throwable readErr) {
+            /*
+             * 看门狗 destroy() 之后，这里的 readLine() 会抛
+             * "InterruptedIOException: read interrupted by close() on another thread"。
+             * 那是**我们主动杀进程**造成的，不是真的错误 —— 必须换成
+             * 人话的 TimeoutException，否则用户（和日志）看到的是一串 Java 异常，
+             * 完全不知道是"卡死超时"。
+             */
+            if (timedOut[0]) {
+                throw new java.util.concurrent.TimeoutException("命令卡死：" + why[0]);
+            }
+            throw readErr;
         }
-        return p.waitFor();
+        int code = p.waitFor();
+        watchdog.interrupt();
+        if (timedOut[0]) {
+            throw new java.util.concurrent.TimeoutException("命令卡死：" + why[0]);
+        }
+        return code;
     }
 
     // ── Phase 1c/2：dsh web 的启动与 URL 解析已移到 DshService ──
@@ -1037,6 +2394,317 @@ public class MainActivity extends Activity {
         appendReport("  WebView 加载: " + url + "\n");
     }
 
+    // ── 插件把前端卡死时的自救（配合 patch.js 的 bootWatchdog）──────────
+
+    private static final String KEY_BOOT_FAIL = "boot_fail_count";
+
+    /** 自动自救（停用第三方插件）已经做过几次 —— 用来防止"停用→重启"无限打转。 */
+    private static final String KEY_AUTO_FIX = "auto_fix_count";
+
+    /**
+     * 自动自救次数上限。
+     *
+     * <p>为什么必须有上限：如果界面起不来**不是因为插件**（容器坏了、网络断了、
+     * 版本不匹配……），那"停用插件 + 重启"永远不会成功 —— 没有上限就是无限重启，
+     * 用户会看到界面一直闪、插件一个个消失。超过上限就停止自动动手，
+     * 改成亮面板把决定权交回用户，并提示发日志。
+     */
+    private static final int AUTO_FIX_MAX = 2;
+
+    private int autoFixCount() {
+        try {
+            return getSharedPreferences(PhoneBridge.PREFS, MODE_PRIVATE).getInt(KEY_AUTO_FIX, 0);
+        } catch (Throwable t) { return 0; }
+    }
+
+    private void setAutoFixCount(int n) {
+        try {
+            getSharedPreferences(PhoneBridge.PREFS, MODE_PRIVATE).edit()
+                    .putInt(KEY_AUTO_FIX, n).apply();
+        } catch (Throwable ignore) { }
+    }
+
+    private int bootFailCount() {
+        try {
+            return getSharedPreferences(PhoneBridge.PREFS, MODE_PRIVATE).getInt(KEY_BOOT_FAIL, 0);
+        } catch (Throwable t) { return 0; }
+    }
+
+    private void setBootFailCount(int n) {
+        try {
+            getSharedPreferences(PhoneBridge.PREFS, MODE_PRIVATE).edit()
+                    .putInt(KEY_BOOT_FAIL, n).apply();
+        } catch (Throwable ignore) { }
+    }
+
+    /** 逗号连起来，给对话框用。 */
+    private static String join(List<String> list) {
+        StringBuilder sb = new StringBuilder();
+        for (String s : list) { if (sb.length() > 0) sb.append("、"); sb.append(s); }
+        return sb.length() == 0 ? "（无）" : sb.toString();
+    }
+
+    /** 官方三件套 + 自带插件 —— 这些不该被"自救"停掉。 */
+    private static boolean isProtectedBundle(String name) {
+        return "@deepseek-ai/dsh-base".equals(name)
+                || "@deepseek-ai/dsh-web-app".equals(name)
+                || Env.PHONE_PLUGIN_NAME.equals(name)
+                || Env.PHONE_FILES_NAME.equals(name);
+    }
+
+    /** profile 里**不是**官方/自带的那些（也就是用户自己装的第三方插件）。 */
+    private List<String> thirdPartyBundles() {
+        List<String> out = new java.util.ArrayList<>();
+        try {
+            for (String b : Env.profileBundles(this)) {
+                if (!isProtectedBundle(b)) out.add(b);
+            }
+        } catch (Throwable ignore) { }
+        return out;
+    }
+
+    /**
+     * 这段失败文本看起来是不是"插件引起的"。
+     *
+     * <p>用途：决定自动自救时是"只停被点名的"还是"停掉全部第三方插件"。
+     * 注意"界面空白 25 秒"这种上报里没有任何文字，这里会返回 false ——
+     * 但那不代表与插件无关，所以调用方**并不用它来否决**自动自救，
+     * 只看"有没有第三方插件可停"。
+     */
+    private static boolean looksPluginRelated(String detail) {
+        if (detail == null || detail.isEmpty()) return false;
+        String s = detail.toLowerCase(java.util.Locale.ROOT);
+        return s.contains("plugin") || s.contains("activate") || s.contains("pending")
+                || s.contains("waiting for service") || s.contains("failed to load")
+                || detail.contains("插件");
+    }
+
+    /**
+     * 从 DSH 的启动失败文本里抠出"可疑的插件包名"。
+     *
+     * <p>文本长这样（真机截图）：
+     * <pre>
+     *   dsh-speech: pending (waiting for service: settingsScope)
+     *   dsh-mobile-gateway: pending (waiting for service: settingsScope)
+     * </pre>
+     * 只保留**确实登记在 profile 里、且不是官方那几件**的名字 ——
+     * 否则可能把官方包一起停掉，那界面更起不来。
+     */
+    private List<String> suspectBundles(String detail) {
+        List<String> out = new java.util.ArrayList<>();
+        try {
+            List<String> registered = Env.profileBundles(this);
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("(?m)^\\s*([@A-Za-z0-9._/-]+)\\s*:\\s*(pending|failed|error)")
+                    .matcher(detail == null ? "" : detail);
+            while (m.find()) {
+                String name = m.group(1).trim();
+                if (registered.contains(name) && !out.contains(name) && !isProtectedBundle(name)) {
+                    out.add(name);
+                }
+            }
+        } catch (Throwable ignore) { }
+        return out;
+    }
+
+    /**
+     * 前端自检报告"插件把界面卡住了"时的自救入口。
+     *
+     * <h3>为什么这件事必须由 App 做</h3>
+     * 前端卡死时用户**什么都点不到** —— 状态栏在"服务就绪"后已经被收起，
+     * WebView 里是一屏白或一屏报错，唯一出路是卸载重装（容器 150MB 白下）。
+     * 所以这里要：亮回顶栏 → 说清原因 → 给一键"停用坏插件 / 安全模式"的出口。
+     *
+     * <p>连续两次失败就**自动**进安全模式：坏插件不会自己好，
+     * 让用户在同一个坑里反复点「重试」是最糟的体验。
+     */
+    /**
+     * 把插件传来的路径限制在**共享存储**里（容器里的 /sdcard 就是它）。
+     *
+     * <p>为什么要这么小心：面板可以列目录，而 App 自己的私有目录（含容器、API Key、
+     * 白名单）就在同一个进程能摸到的地方。规范化之后做前缀校验，
+     * 目录穿越（`../`）与绝对路径越界都会被挡掉。
+     *
+     * @return 可用的目录/文件；越界或非法返回 null
+     */
+    private static File resolveSharedDir(String path) {
+        try {
+            File ext = android.os.Environment.getExternalStorageDirectory();
+            String rootPath = ext.getCanonicalPath();
+            if (path == null || path.trim().isEmpty()) return ext;
+            String p = path.trim();
+            // 容器视角的几种写法都归一到共享存储根
+            if (p.equals("/sdcard") || p.equals("/") || p.equals(rootPath)) return ext;
+            if (p.startsWith("/sdcard/")) p = p.substring("/sdcard".length());
+            else if (p.startsWith("/storage/emulated/0/")) p = p.substring("/storage/emulated/0".length());
+            else if (p.startsWith(rootPath)) p = p.substring(rootPath.length());
+            File f = new File(ext, p);
+            String canon = f.getCanonicalPath();
+            if (!canon.equals(rootPath) && !canon.startsWith(rootPath + File.separator)) return null;
+            return f;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * 前端自检报告"插件把界面卡住了"时的自救入口。
+     *
+     * <h3>为什么这件事必须由 App 做</h3>
+     * 前端卡死时用户**什么都点不到** —— 状态栏在"服务就绪"后已经被收起，
+     * WebView 里是一屏白或一屏报错，唯一出路是卸载重装（容器 150MB 白下）。
+     *
+     * <h3>现在的行为：进不去就**自动**把第三方插件停掉</h3>
+     * 第一次上报就动手，不等用户点（用户要的就是这个）：
+     *   · 上报里点名了某个插件 → 只停它；
+     *   · 没点名（例如"空白 25 秒"）→ 停掉全部第三方插件；
+     *   然后自动重启 dsh。停用的清单记在 App 的 prefs 里，
+     *   可以从「手机权限 → 插件安全模式」一键恢复。
+     *
+     * <p>自动动手有上限（{@link #AUTO_FIX_MAX}）：如果根本不是插件的问题，
+     * "停用+重启"永远救不回来，没有上限就会无限重启、插件还会一个个消失。
+     * 超过上限就停止自动动手，改为亮面板把决定权交回用户。
+     */
+    private void onPluginBootFailed(String detail) {
+        appendReport("  ⚠️ 前端自检：插件可能把界面卡住了\n"
+                + (detail == null || detail.isEmpty() ? "" : detail + "\n"));
+        // 同时写到界面上：用户截图/复制日志时能看到这一行
+        output.append("  ⚠️ 前端自检：插件可能把界面卡住了"
+                + "（profile 里登记了 " + Env.profileBundles(this).size() + " 个插件："
+                + join(Env.profileBundles(this)) + "）\n");
+
+        int fails = bootFailCount() + 1;
+        setBootFailCount(fails);
+        List<String> suspects = suspectBundles(detail);
+
+        /*
+         * ── 自动自救：进不去就自己把第三方插件停掉 ──
+         *
+         * 用户的要求是"进不去就自动禁用第三方插件"，所以**第一次失败就动手**，
+         * 不再先弹面板等他点一下 —— 他此刻面对的是一屏白/一屏报错，
+         * 让他先看懂面板再点按钮，本身就是负担。
+         *
+         * 停谁，分两档：
+         *   · 报错文本里点名了的（suspects）→ 只停它们，最精准；
+         *   · 没点名（例如"空白 25 秒"这种没有任何文字的上报）→ 退化为安全模式，
+         *     停掉**全部**第三方插件。
+         *
+         * 什么时候不自作主张：
+         *   · profile 里压根没有第三方插件可停 → 问题不在插件上，
+         *     亮面板让用户看日志、给「重试」；
+         *   · 已经自动救过 AUTO_FIX_MAX 次 → 说明停了也没用，
+         *     不能无限"停用→重启"，此时改成亮面板 + 让用户发日志。
+         */
+        List<String> autoTargets = suspects.isEmpty() ? thirdPartyBundles() : suspects;
+        boolean canAuto = fails <= AUTO_FIX_MAX && !autoTargets.isEmpty();
+
+        if (canAuto) {
+            int n = Env.disableBundles(this, autoTargets);
+            setAutoFixCount(autoFixCount() + 1);
+            logSafeModeResult("自动停用并重启", n);
+            appendReport("     判定依据：" + (suspects.isEmpty()
+                    ? "上报里没有点名（按安全模式处理：停掉全部第三方插件）"
+                    : "上报里点名了 " + join(suspects))
+                    + (looksPluginRelated(detail) ? " · 文本特征：插件相关" : "") + "\n");
+            final int stopped = n;
+            runOnUiThread(() -> {
+                android.widget.Toast.makeText(this,
+                        "界面起不来，已自动停用 " + stopped + " 个第三方插件并重启"
+                      + "（可在「手机权限 → 插件安全模式」恢复）",
+                        android.widget.Toast.LENGTH_LONG).show();
+                output.append("  🛠 自动自救：已停用 " + stopped + " 个插件 → "
+                        + join(Env.disabledBundles(this))
+                        + "\n     恢复入口：设置 → 手机权限 → 插件安全模式\n");
+            });
+            restartDshAndWait();
+            return;
+        }
+
+        runOnUiThread(() -> {
+            // 顶栏在就绪后被收起来了，必须亮回来，否则这里一个可点的东西都没有
+            if (topBar != null) {
+                topBar.animate().cancel();
+                topBar.setAlpha(1f);
+                topBar.setVisibility(View.VISIBLE);
+            }
+            if (retryButton != null) retryButton.setVisibility(View.VISIBLE);
+            output.setVisibility(View.VISIBLE);
+            webView.setVisibility(View.GONE);
+
+            /*
+             * 走到这里说明"自动自救"没能用上或没管用：
+             *   · profile 里没有第三方插件可停 —— 问题不在插件上；
+             *   · 或者已经自动救过 AUTO_FIX_MAX 次还是起不来 —— 再停也没意义。
+             * 两种情况都必须把话说清楚，并且给一个能点的出口。
+             */
+            StringBuilder sb = new StringBuilder();
+            if (autoFixCount() > 0) {
+                sb.append("已经自动停用第三方插件并重启过 ")
+                  .append(autoFixCount()).append(" 次，界面仍然起不来 —— ")
+                  .append("所以问题很可能不在插件上（容器/网络/版本不匹配都可能导致）。\n\n");
+            } else {
+                sb.append("界面没能加载出来，但 profile 里没有第三方插件可停 —— ")
+                  .append("问题不在插件上。\n\n");
+            }
+            sb.append("DSH 0.2 改过一些内部服务名（例如 settingsScope 变成了 settings），")
+              .append("为 0.1.x 写的插件会一直等一个不存在的服务，")
+              .append("前端就永远停在 pending —— 那类问题会自动被停用处理掉。\n\n");
+            // 把"profile 里到底登记了哪些插件"摊出来 —— 排查和自救都要靠它
+            List<String> registered = Env.profileBundles(this);
+            sb.append("profile 里登记了 ").append(registered.size()).append(" 个插件：")
+              .append(join(registered)).append("\n\n");
+            if (!suspects.isEmpty()) {
+                sb.append("这次检测到可疑插件：\n");
+                for (String s : suspects) sb.append("  · ").append(s).append('\n');
+                sb.append('\n');
+            }
+            if (!Env.disabledBundles(this).isEmpty()) {
+                sb.append("已停用待恢复：").append(join(Env.disabledBundles(this))).append("\n\n");
+            }
+            sb.append("可以先点「重试」；还不行就把日志发给开发者 —— ")
+              .append("「手机权限 → 复制运行日志」。");
+
+            new AlertDialog.Builder(this)
+                    .setTitle("界面没能加载出来")
+                    .setMessage(sb.toString())
+                    .setPositiveButton("重试", (d, w) -> restartDshAndWait())
+                    .setNeutralButton("安全模式并重启", (d, w) -> {
+                        int n = Env.enterSafeMode(this);
+                        logSafeModeResult("手动安全模式", n);
+                        restartDshAndWait();
+                    })
+                    .setNegativeButton("复制日志", (d, w) -> copyLogToClipboard())
+                    .show();
+        });
+    }
+
+    /**
+     * 把"停用插件"的结果直接写到界面上。
+     *
+     * <p>为什么值得专门打一行：这一步一旦没生效，用户看到的就只是
+     * "重启了但界面还是坏的"，完全无从判断。这一行把三件事说清楚：
+     * 停用了几个、现在 profile 里还剩谁、以后能在哪里恢复。
+     */
+    private void logSafeModeResult(String how, int n) {
+        String line = "  [自救·" + how + "] 停用 " + n + " 个插件；"
+                + "现在加载：" + join(Env.profileBundles(this))
+                + "；待恢复：" + join(Env.disabledBundles(this)) + "\n";
+        appendReport(line);
+        output.append(line);
+    }
+
+    /** 改完 plugins/bundles 之后重启容器里的 dsh，并等它给出新 URL。 */
+    private void restartDshAndWait() {        try {
+            final String oldUrl = dshUrl;
+            sLastFailure = null;
+            output.append("正在重启容器里的 DSH（按新的插件列表加载）…\n");
+            DshService.requestRestart();
+            new Thread(() -> awaitUrl(oldUrl), "await-restart").start();
+        } catch (Throwable t) {
+            onProvisionFailed(t);
+        }
+    }
+
     /** 暴露给注入脚本的极小桥：只提供"打开本 App 页面"的能力。 */
     private class AppBridge {
         @android.webkit.JavascriptInterface
@@ -1044,7 +2712,7 @@ public class MainActivity extends Activity {
             runOnUiThread(MainActivity.this::showSettingsDialog);
         }
 
-        /** 打开「📱 手机控制」白名单页。 */
+        /** 打开「手机控制」白名单页。 */
         @android.webkit.JavascriptInterface
         public void openAppControl() {
             runOnUiThread(() -> {
@@ -1052,6 +2720,156 @@ public class MainActivity extends Activity {
                     startActivity(new Intent(MainActivity.this, AppControlActivity.class));
                 } catch (Throwable t) {
                     Log.e(TAG, "打开手机控制页失败", t);
+                }
+            });
+        }
+
+        /** 打开「应用白名单」页（勾选允许 DSH 操作的 App）。 */
+        @android.webkit.JavascriptInterface
+        public void openWhitelist() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(MainActivity.this, WhitelistActivity.class));
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开白名单页失败", t);
+                }
+            });
+        }
+
+        /** 打开「插件市场」页。 */
+        @android.webkit.JavascriptInterface
+        public void openPluginMarket() {            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(MainActivity.this, PluginMarketActivity.class));
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开插件市场失败", t);
+                }
+            });
+        }
+
+        /** 打开「手机权限」大类页（手机控制/白名单/插件市场/常驻服务/内核升级/桌面图标）。 */
+        @android.webkit.JavascriptInterface
+        public void openPhonePerm() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(MainActivity.this, PhonePermActivity.class));
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开手机权限页失败", t);
+                }
+            });
+        }
+
+        /**
+         * 「手机文件」插件用：列出某个目录。
+         *
+         * <p>返回 JSON 数组：`[{name,dir,size,path}]`，目录在前、名字不区分大小写排序。
+         * 路径**只允许在共享存储内**（见 resolveSharedDir）—— 这个面板是给用户挑文件用的，
+         * 不该变成"浏览 App 私有目录"的后门。
+         */
+        @android.webkit.JavascriptInterface
+        public String listFiles(String path) {
+            try {
+                File dir = resolveSharedDir(path);
+                if (dir == null || !dir.isDirectory()) return "[]";
+                File[] kids = dir.listFiles();
+                if (kids == null) return "[]";
+                java.util.Arrays.sort(kids, (a, b) -> {
+                    if (a.isDirectory() != b.isDirectory()) return a.isDirectory() ? -1 : 1;
+                    return a.getName().compareToIgnoreCase(b.getName());
+                });
+                org.json.JSONArray arr = new org.json.JSONArray();
+                int n = 0;
+                for (File f : kids) {
+                    if (n >= 2000) break;                        // 超大目录先截断，别把面板卡死
+                    if (f.getName().startsWith(".")) continue;   // 隐藏文件不列，面板保持干净
+                    org.json.JSONObject o = new org.json.JSONObject();
+                    o.put("name", f.getName());
+                    o.put("dir", f.isDirectory());
+                    o.put("size", f.isDirectory() ? 0 : f.length());
+                    o.put("path", f.getAbsolutePath());
+                    arr.put(o);
+                    n++;
+                }
+                return arr.toString();
+            } catch (Throwable t) {
+                return "[]";
+            }
+        }
+
+        /**
+         * 前端自检发现"插件把界面卡住了"时回调（见 tools/patch.js 的 bootWatchdog）。
+         *
+         * <p>带原文进来，App 从里面抠出可疑的插件包名。
+         */
+        @android.webkit.JavascriptInterface
+        public void pluginBootFailed(final String detail) {
+            runOnUiThread(() -> onPluginBootFailed(detail == null ? "" : detail));
+        }
+
+        /** 前端确认界面正常渲染了 → 把"连续启动失败"与"自动自救"计数都清零。 */
+        @android.webkit.JavascriptInterface
+        public void pageReady() {
+            runOnUiThread(() -> {
+                if (bootFailCount() != 0 || autoFixCount() != 0) {
+                    setBootFailCount(0);
+                    setAutoFixCount(0);
+                    appendReport("  ✅ 界面正常，启动失败/自动自救计数已清零\n");
+                }
+            });
+        }
+
+        /** 打开「桌面图标」配色选择页。 */
+        @android.webkit.JavascriptInterface
+        public void openIcons() {            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(MainActivity.this, IconActivity.class));
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开图标页失败", t);
+                }
+            });
+        }
+
+        /** 打开「DSH 内核升级」页。 */
+        @android.webkit.JavascriptInterface
+        public void openUpgrade() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(MainActivity.this, UpgradeActivity.class));
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开内核升级页失败", t);
+                }
+            });
+        }
+
+        /** 打开「容器常驻服务」页（CLIProxyAPI 这类本地代理配在这里）。 */
+        @android.webkit.JavascriptInterface
+        public void openServices() {
+            runOnUiThread(() -> {
+                try {
+                    startActivity(new Intent(MainActivity.this, ServicesActivity.class));
+                } catch (Throwable t) {
+                    Log.e(TAG, "打开常驻服务页失败", t);
+                }
+            });
+        }
+
+        /**
+         * 用手机上的其它应用打开一个文件 —— 弹出系统的「选择打开方式」。
+         *
+         * <p>为什么要由 App 来做：DSH 的「在默认程序中打开 / 打开方式」是
+         * **服务端**行为（POST /open-in-app/open，让运行 dsh 的主机去拉桌面程序）。
+         * 手机上主机就是容器，容器里没有桌面，所以那个按钮永远失败
+         * （报"此主机没有可用的桌面"）。注入脚本会把那次请求截下来改调这里。
+         *
+         * @param path DSH 给的路径（手机存储的 /sdcard/... 或容器内的 /root/...）
+         */
+        @android.webkit.JavascriptInterface
+        public void openPath(final String path) {
+            runOnUiThread(() -> {
+                String err = OpenWith.open(MainActivity.this, path);
+                if (err != null) {
+                    android.widget.Toast.makeText(MainActivity.this, err,
+                            android.widget.Toast.LENGTH_LONG).show();
                 }
             });
         }
@@ -1116,13 +2934,26 @@ public class MainActivity extends Activity {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(pad, pad, pad, pad);
 
+        boolean ready = isContainerReady() && DshService.getUrl() != null;
+
         TextView tip = new TextView(this);
         tip.setTextSize(13f);
         tip.setText("填入 DeepSeek API Key（在 platform.deepseek.com 申请）。\n\n"
                 + "· Key 只保存在本机 App 私有目录，不会上传到任何地方；\n"
                 + "· 它是通过环境变量 DEEPSEEK_API_KEY 传给容器内的 DSH；\n"
-                + "· 保存后会自动重启容器里的 DSH 使其生效。");
+                + (ready ? "· 保存后会自动重启容器里的 DSH 使其生效。"
+                         : "· 容器还没启动，保存后会在它启动时自动生效。"));
         box.addView(tip);
+
+        // 最近一次失败原因（有才显示）—— 普通用户拿不到 report.txt，这是唯一的线索
+        if (sLastFailure != null) {
+            TextView fail = new TextView(this);
+            fail.setTextSize(12f);
+            fail.setTextColor(Color.parseColor("#FF8A80"));
+            fail.setText("\n最近一次初始化失败：\n" + sLastFailure);
+            box.addView(fail);
+        }
+
 
         final EditText input = new EditText(this);
         input.setHint("sk-...");
@@ -1136,32 +2967,83 @@ public class MainActivity extends Activity {
         new AlertDialog.Builder(this)
                 .setTitle("DeepSeek API Key")
                 .setView(box)
-                .setPositiveButton("保存并重启 DSH", (d, w) -> {
+                .setPositiveButton(ready ? "保存并重启 DSH" : "保存", (d, w) -> {
                     String k = input.getText().toString().trim();
                     DshService.setApiKey(this, k);
-                    appendReport("  [设置] API Key " + (k.isEmpty() ? "已清空" : "已更新")
-                            + "，重启容器…\n");
-                    restartDsh();
+                    appendReport("  [设置] API Key " + (k.isEmpty() ? "已清空" : "已更新") + "\n");
+                    applyApiKeyAndMaybeRestart();
                 })
+                .setNeutralButton("复制日志", (d, w) -> copyLogToClipboard())
                 .setNegativeButton("取消", null)
                 .show();
     }
 
+    /** 把 report.txt 末尾若干行复制到剪贴板，方便用户直接发给开发者。 */
+    private void copyLogToClipboard() {
+        try {
+            String text = readTail(reportFile, 200);
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("DSH 日志", text));
+                android.widget.Toast.makeText(this, "日志已复制，可直接粘贴发给开发者",
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
+        } catch (Throwable t) {
+            android.widget.Toast.makeText(this, "复制失败: " + t.getMessage(),
+                    android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** 读文件末尾 maxLines 行（文件可能很大，从尾部倒着读）。 */
+    private String readTail(File f, int maxLines) throws Exception {
+        if (f == null || !f.exists()) return "(没有日志)";
+        java.util.ArrayDeque<String> lines = new java.util.ArrayDeque<>();
+        try (BufferedReader br = new BufferedReader(new java.io.FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                lines.addLast(line);
+                if (lines.size() > maxLines) lines.removeFirst();
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String l : lines) sb.append(l).append('\n');
+        return sb.toString();
+    }
+
     /**
-     * 让新的 API Key 生效。
+     * 让新的 API Key 生效 —— **只在容器真的在跑的时候才重启**。
      *
-     * 注意：这里**不**用 stopService/startService。实测那样做有两个问题：
+     * 原来的实现无条件 `requestRestart()` + 把界面切成"重启中"，
+     * 于是首次运行时（容器还没装好）用户一保存 Key，界面就进入
+     * "已保存设置，正在重启容器内的 DSH…" 且再也回不来 —— 这就是
+     * 新人手机上"卡住"的直接原因。
+     *
+     * 现在：容器没跑就只保存（DshService.startDsh() 每次启动都会重新读 Key），
+     * 并如实告诉用户；容器在跑才走原来的重启流程。
+     *
+     * 另外：这里**不**用 stopService/startService。实测那样做有两个问题：
      *  · stop 与 start 之间只隔 1.2s，系统会把两次请求合并成同一个实例，重启落空；
      *  · 即使停掉，旧 proot 的 tracee（node/dsh）会变成占着 3080 端口的孤儿进程。
      * 改为给前台服务置一个"重启标记"，由它自己的监督循环完成清理与重启。
      */
-    private void restartDsh() {
+    private void applyApiKeyAndMaybeRestart() {
+        boolean running = DshService.isAlive() || DshService.getUrl() != null;
+        if (!running) {
+            // 容器还没跑起来：不重启、也不切界面，避免把自己锁在"重启中"上
+            liveProgress("  · 已保存，容器首次启动时会自动使用该 Key\n");
+            android.widget.Toast.makeText(this, "已保存，容器启动后自动生效",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+
         final String oldUrl = dshUrl;
         dshUrl = null;
         runOnUiThread(() -> {
             webView.setVisibility(View.GONE);
             output.setVisibility(View.VISIBLE);
-            output.setText("已保存设置，正在重启容器内的 DSH…\n");
+            // 用 append 而不是 setText —— 否则会把已有的进度/日志全擦掉
+            output.append("\n已保存设置，正在重启容器内的 DSH…\n");
             statusBar.setText("DeepSeek Harness · 重启中…");
         });
         DshService.requestRestart();
@@ -1178,6 +3060,7 @@ public class MainActivity extends Activity {
      *                    所以必须等一个**不同的** URL，否则会立刻把旧页面当成新的。
      */
     private void awaitUrl(String previousUrl) {
+        long t0 = System.currentTimeMillis();
         for (int i = 0; i < 240; i++) {
             String u = DshService.getUrl();
             if (u != null && !u.equals(previousUrl)) {
@@ -1186,18 +3069,40 @@ public class MainActivity extends Activity {
                 appendReport("  ✅ 服务就绪（前台服务）: " + u + "\n");
                 return;
             }
-            if (i % 10 == 9) {
+            /*
+             * 20 秒还没看到前台服务被创建，就不用再等 4 分钟了 ——
+             * 这说明 startForegroundService 根本没生效（被系统拦截），
+             * 直接给出确切原因，比笼统的"超时"有用得多。
+             */
+            if (i == 20 && !DshService.isCreated()) {
+                onProvisionFailed(new IllegalStateException(
+                        "前台服务没有启动起来（系统可能拦截了后台服务）。\n"
+                      + "   · 请到系统设置里允许本应用「自启动 / 后台运行」后点「重试」"));
+                return;
+            }
+            if (i % 5 == 4) {
                 final String st = DshService.getState();
-                runOnUiThread(() -> statusBar.setText("DeepSeek Harness · " + st));
+                final long el = System.currentTimeMillis() - t0;
+                runOnUiThread(() -> statusBar.setText(
+                        "DeepSeek Harness · " + st + "（已 " + fmtDuration(el) + "）"));
             }
             try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
         }
-        final String st = DshService.getState();
-        runOnUiThread(() -> {
-            output.setVisibility(View.VISIBLE);
-            output.append("\n等待 dsh web 超时 · 状态: " + st + "\n");
-        });
-        appendReport("  ❌ 等待超时 · 状态: " + st + "\n");
+        /*
+         * 超时不能是死胡同。
+         *
+         * 原来这里只是往日志追加一行，界面既不恢复也没有任何可点的东西 ——
+         * 用户看到的就是"卡住了"，唯一出路是卸载重装。
+         * 现在走 onProvisionFailed：日志区恢复可见、给出原因、亮出「重试」。
+         *
+         * 并且把 dsh 自己最后的输出一起带出来 —— 这才是真正能定位问题的信息
+         * （端口占用 / 依赖缺失 / 启动异常都会体现在那里）。
+         */
+        onProvisionFailed(new java.util.concurrent.TimeoutException(
+                "等待 dsh web 超时（4 分钟）\n"
+              + "   · 服务状态: " + DshService.getState() + "\n"
+              + "   · 端口: 127.0.0.1:" + Env.port() + "\n"
+              + "   · dsh 最后输出:\n" + DshService.getRecentOutput()));
     }
 
     private void startDshService() {
@@ -1207,10 +3112,55 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        /*
+         * 前台服务发现"容器未安装完成"时会置位 sNeedsProvision。
+         *
+         * 原来这种情况只会往通知栏写一句"请打开 App 完成初始化"，
+         * 用户回到 App 却什么都不发生 —— 看着就是卡死。
+         * 现在回到前台自动补跑初始化（有互斥，不会重复起线程）。
+         */
+        if (DshService.getNeedsProvision() && !sProvisioning.get()) {
+            startProvisioning("回到前台补跑");
+            return;
+        }
+        /*
+         * 容器在后台被重启过时（token 变了 / 端口换了），WebView 还指着旧地址，
+         * 表现就是"界面连不上/一直转圈"。回到前台发现地址变了就重新加载。
+         */
+        String cur = DshService.getUrl();
+        if (cur != null && !cur.equals(dshUrl) && !sProvisioning.get()) {
+            appendReport("  · 容器地址已变化，重新加载 WebView: " + cur + "\n");
+            dshUrl = cur;
+            onServerReady(cur);
+        }
+        /*
+         * 心跳：在**前台时**每 5 秒看一眼容器地址和页面内容。
+         *
+         * 这里是「用久了白屏」的关键补丁：以前只有 onResume 会比对地址，
+         * 而用户白屏时人一直停在 App 里 —— 不切后台就永远等不到那一比对，
+         * 于是界面永远连不上，只能"杀 App / 卸载重装"。
+         *
+         * 放在前台才跑：退回后台时前台服务在跑容器，不需要 Activity 操心。
+         */
+        startHeartbeat();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // 退回后台（以及弹出文件选择器/相册）时停掉心跳：既省电，
+        // 也避免"用户正在选文件时页面被自动重载"。
+        stopHeartbeat();
+    }
+
+    @Override
     protected void onDestroy() {
         // 注意：这里**不能**杀 dsh 进程 —— 它属于前台服务。
         // 早先的版本在 onDestroy 里 destroy() 它，会导致一退出 App 容器就死。
         // 需要真正停止时用 stopService()。
+        stopHeartbeat();
         super.onDestroy();
     }
 
@@ -1302,6 +3252,13 @@ public class MainActivity extends Activity {
                 new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
             String line;
             while ((line = br.readLine()) != null) sb.append(line).append('\n');
+        }
+        // 这些是短命令，但同样不能无限等 —— proot 起不来时 readLine 会一直挂着。
+        boolean finished = p.waitFor(EXEC_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        if (!finished) {
+            p.destroy();
+            Env.killStaleDsh(Env.base(this));
+            return sb + "[timeout] 命令超过 " + (EXEC_TIMEOUT_MS / 1000) + " 秒未结束，已强制终止\n";
         }
         int code = p.waitFor();
         sb.append("[exitCode=").append(code).append(']');

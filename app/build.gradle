@@ -25,8 +25,8 @@ android {
         applicationId "com.dshmobile.probe"
         minSdk 24
         targetSdk 28          // ← 不许改大，见上方注释
-        versionCode 3
-        versionName "0.1.2"
+        versionCode 32
+        versionName "0.2.7"
     }
 
     signingConfigs {
@@ -37,6 +37,21 @@ android {
                 keyAlias keystoreProps['keyAlias']
                 keyPassword keystoreProps['keyPassword']
             }
+            /*
+             * 三种签名方案全部打开。
+             *
+             * AGP 默认只签 v2 —— 理论上 minSdk 24（Android 7.0）用 v2 就够，
+             * 但分享出去后在别人手机上装不上。已知会导致"解析包出错 /
+             * 应用未安装"的原因里，v1 缺失是常见一条：
+             *   · 部分国产 ROM 的安装器 / 第三方文件管理器走的是 v1(JAR) 校验路径；
+             *   · Android 7.x 早期版本对"只签 v2"的包有过兼容问题；
+             *   · 一些加固/重签工具也只认 v1。
+             * v1 对现代设备完全无害（只多几十 KB），v3 则支持密钥轮换。
+             * 三个都开是 apksigner 官方推荐的最高兼容性组合。
+             */
+            enableV1Signing true
+            enableV2Signing true
+            enableV3Signing true
         }
     }
 
@@ -78,6 +93,15 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    /*
+     * Shizuku 的"用户服务"要求我们自己也提供一份 AIDL 接口。
+     * AGP 8 起 aidl 默认关闭，必须显式打开，否则 src/main/aidl 里的文件会被静默忽略
+     * —— 表现是编译期报 "cannot find symbol: IShellService"，很容易误判成依赖没引到。
+     */
+    buildFeatures {
+        aidl true
+    }
+
     lint {
         /*
          * targetSdk 28 是**故意**的（Android 10+ 的 W^X 要求，见文件顶部注释），
@@ -93,6 +117,31 @@ dependencies {
     // rootfs 是 .tar.gz，Android 没有内置 tar 解包能力。
     // 用 1.26.2：这个版本没有额外依赖（1.27+ 会强制依赖 commons-io）。
     implementation 'org.apache.commons:commons-compress:1.26.2'
+
+    /*
+     * Shizuku：让"没有电脑"的用户也能拿到那一笔关键权限。
+     *
+     * 背景：避免厂商把无障碍开关关掉，需要 WRITE_SECURE_SETTINGS，
+     * 而这个权限只能通过 `pm grant` 授予一次。有电脑的用户插线执行即可；
+     * 没电脑的用户就靠 Shizuku —— 它以 shell（uid 2000）身份替我们跑这条命令。
+     *
+     * 注意：**Shizuku 本身必须由用户安装并启动**。它的权限来自 ADB 或 root，
+     * 是"从应用外面拿进来的"，任何 APK 都不可能自带（那种东西叫提权漏洞）。
+     *
+     * provider 是必需的那一半：Shizuku 通过一个 ContentProvider 把 binder 交给客户端。
+     */
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+
+    /*
+     * androidx.core 只为了一件事：FileProvider。
+     *
+     * 「用别的应用打开文件」在 targetSdk ≥ 24 时不能再用 file:// 传 URI
+     * （会抛 FileUriExposedException），必须换成 content:// —— 而把它做出来的
+     * 唯一官方途径就是 androidx 的 FileProvider（平台里没有替代品）。
+     * 用 1.13.1：兼容 compileSdk 36，且不引入 appcompat 那一大串。
+     */
+    implementation 'androidx.core:core:1.13.1'
 }
 
 /*

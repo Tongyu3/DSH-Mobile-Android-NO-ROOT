@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标只在 API 26+ 生效，这里给 24~25 兜底。
+  前景图是 432px 的位图，必须显式限尺寸，否则会撑爆 48dp 的图标。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/icon_bg_forest" />
+    <item android:gravity="center"
+          android:width="48dp" android:height="48dp"
+          android:drawable="@mipmap/ic_launcher_foreground" />
+</layer-list>

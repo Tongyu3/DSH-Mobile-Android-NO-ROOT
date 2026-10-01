@@ -1,0 +1,10 @@
+# dsh-phone 的配置层。
+#
+# dsh 的配置是四层叠加，这个文件是其中一层（bundle 自带的 patch）。
+# 新插件行必须写在 insert 下面；覆盖/禁用别的层要写在顶层数组里。
+#
+# id 必须与 index.js 里的 `export const name` 完全一致（都是 phone），
+# 不一致的话插件会静默不生效 —— 这是最容易踩的坑。
+- insert:
+    - id: phone
+      name: dsh-phone

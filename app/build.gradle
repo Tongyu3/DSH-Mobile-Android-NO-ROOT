@@ -25,8 +25,8 @@ android {
         applicationId "com.dshmobile.probe"
         minSdk 24
         targetSdk 28          // ← 不许改大，见上方注释
-        versionCode 40
-        versionName "0.3.2"
+        versionCode 53
+        versionName "0.4.1"
     }
 
     signingConfigs {

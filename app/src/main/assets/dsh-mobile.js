@@ -652,6 +652,19 @@
     var collapsed = !!side.querySelector('[class*="collapsed"]');
 
     /*
+     * ⚠️ 第七轮那个"按 DSH 按钮标签反向镜像状态"的 observer 与轮询已**删除**。
+     *
+     * 逐帧实测（tools/rail-who-moves.js）证明 DSH 的按钮标签**跟画面不对应**：
+     * 点它标签会翻转，但抽屉 tx 恒为 0（一动不动）。
+     * 于是"按标签写我们的属性"会把画面**写反** ——
+     * 用户点侧边栏的关闭按钮时 DSH 把标签改成「收起」，我们据此把抽屉**打开**，
+     * 这就是他报的"关不掉"。
+     *
+     * 现在状态只有一份：`body[data-dsh-rail-hidden]`，由 requestRail 直接写。
+     * 没有第二个写者，也就不会有互相覆盖。
+     */
+
+    /*
      * 清掉旧版补丁遗留在内联样式上的 !important —— 重新注入（不刷新页面）时，
      * 内联样式会盖过新 CSS，导致"改了却没效果"。
      */
@@ -672,39 +685,86 @@
         ev.preventDefault();
         ev.stopPropagation();
         /*
-         * 先乐观地把状态切到"展开"，再触发 DSH 自己的切换。
+         * ★ 纯委托（第五轮定稿）：状态权威只有 DSH 一个。
          *
-         * 为什么：真正的状态同步是靠 MutationObserver + 150ms 去抖的，
-         * 如果只等它，抽屉会在点击后 150ms 才开始动 —— 手感上就是"顿一下再弹出来"。
-         * 这里提前置位，动画就能从**这一帧**开始。
+         * 历次踩的坑都指向同一件事 —— **我们不该自己去改状态**：
+         *   · 第一版"先乐观置位 requestRail(false)，再当场找 DSH 按钮点击"：
+         *     写 railExplicitShowUntil 把自动同步挡掉 600ms，DSH 随后的展开
+         *     反而没人跟进，状态停在收起（真机实测 800ms 后仍是收起 ❌）；
+         *   · 现在 requestRail 自己就负责"去点 DSH 的正确按钮"
+         *     （见 requestRail 的第四轮说明），所以这里只需要调用它。
          */
-        requestRail(false);
-        var o = document.querySelector('[class*="sidebarCol"] button[aria-label*="侧边栏"]');
-        if (o) o.click();
+        requestRail(false, true);
       }, true);
       document.body.appendChild(btn);
     }
 
-    if (collapsed) {
-      /*
-       * 只切换一个 body 属性 —— 栅格列宽、抽屉宽度与位移**全部交给 CSS**。
-       *
-       * 之前这里用内联 !important 去改 width / min-width / overflow /
-       * grid-template-columns，既和 CSS 互相打架，也正是动画跳变的来源
-       * （内联的 grid-template-columns 让轨道数在 3 与 1 之间跳）。
-       * 另外注意：仍然不能用 display:none —— 侧边栏是栅格 item，
-       * 移出栅格流会让后面的列整体前移一格，整屏会变空白。
-       */
+    /*
+     * ★★★ 冷启动初始态（本次线上报障的修复点）。
+     *
+     * 【现象】新装/冷启动后一进应用就是**一个大开着的侧边栏**（只有图标那一列），
+     *   主界面被挤到右边，看着像"卡在一个陌生界面"。
+     *
+     * 【触发条件】仅冷启动（进程首次进入）；之后手动开关都正常。
+     *
+     * 【根因】CSS 的判据是 `body:not([data-dsh-rail-hidden="1"]) [class*=sidebarCol]{
+     *   transform:none }` —— 属性**不存在**就等于"展开"。
+     * 而启动时没有任何代码写过这个属性，原来负责写它的
+     * `syncDshLabelToRail()` 是这么找按钮的：
+     *     findRailToggle(!hiddenNow)   // hiddenNow=false → 找「打开侧边栏」
+     * 偏偏「打开侧边栏」按钮被我们自己的 CSS 设成了 `display:none`，
+     * querySelector 找不到 → 函数直接返回 false → **属性从来没被写** → 抽屉以展开态启动。
+     * （这也是"隐身按钮"这个设计带来的副作用：状态同步依赖一个不可见的按钮。）
+     *
+     * 【修法】不再依赖找按钮：冷启动时由补丁**直接确定初始态 = 收起**，
+     * 这正是本 App 的手机端设计（先看对话，点左上角鲸鱼唤出抽屉）。
+     * 用模块级一次性标记，避免每次 apply() 都把用户手动打开的抽屉强行关掉。
+     */
+    initRailOnce();
+
+  }
+
+  /**
+   * 冷启动只做一次：把抽屉的初始态定为**收起**。
+   *
+   * 详见调用处（patchSidebar 里）的根因说明：
+   * 属性"不存在"就等于展开，而启动时没人写过它，于是以展开态启动。
+   *
+   * 用一次性标记而不是"每次 apply 都写"：
+   * apply() 会因为 DOM 变化被反复调用，若每次都写 '1'，
+   * 用户手动打开抽屉后会被下一次 apply 又关掉（那是另一种 bug）。
+   */
+  function initRailOnce() {
+    if (W.__dshRailInit) return;
+    W.__dshRailInit = true;
+    try {
       document.body.setAttribute('data-dsh-rail-hidden', '1');
-    } else {
-      /*
-       * ⚠️ 只有在**闩锁过期**后才允许按类名把状态改回"展开"。
-       * 收起动画中途 DSH 会短暂没有 collapsed 类（见 requestRail 的说明），
-       * 若这里照做，抽屉会弹回来 —— 就是那个"抽搐"。
-       */
-      if (Date.now() < railLatchUntil) return;
-      document.body.removeAttribute('data-dsh-rail-hidden');
-    }
+      railDiag('冷启动初始态 → 收起');
+    } catch (e) { }
+  }
+
+  /**
+   * 把 **DSH 的按钮标签**对齐到我们这份真相（方向是"真相 → DSH"，不是反过来）。
+   *
+   * 为什么方向不能反：逐帧实测（tools/rail-who-moves.js）证明 DSH 的标签
+   * 跟画面不对应 —— 点它的按钮，标签翻转但抽屉 tx 恒为 0。
+   * 若按标签写我们的属性，就会把画面写反（"关不掉"就是这么来的）。
+   *
+   * 只在标签确实与目标不符时才点，避免把 DSH 的状态翻反。
+   */
+  function syncDshLabelToRail() {
+    try {
+      var hiddenNow = document.body.getAttribute('data-dsh-rail-hidden') === '1';
+      // 想要"收起" → DSH 的按钮应显示「收起侧边栏」；反之显示「打开侧边栏」
+      var mismatched = findRailToggle(!hiddenNow);
+      if (mismatched) {
+        var prev = railDelegating;
+        railDelegating = true;
+        try { mismatched.btn.click(); } finally { railDelegating = prev; }
+        return true;
+      }
+    } catch (e) { }
+    return false;
   }
 
   /**
@@ -724,12 +784,268 @@
    * 等过渡结束（闩锁过期）再按最终类名校准。
    */
   var railLatchUntil = 0;
+  /**
+   * 「用户刚刚明确要求展开抽屉」的窗口。
+   *
+   * 与 {@link railLatchUntil} 的区别（这个区分是本 bug 的关键）：
+   *   · railLatchUntil —— 防止**自动同步**被收起动画的中间态骗到（防"抽搐"）；
+   *   · railExplicitShowUntil —— 用户明确点了展开时，让自动同步**先别管**。
+   * 早先把两者混为一个，结果防抽搐的那道也把用户的操作挡住了，
+   * 表现就是"收起后马上再点开 → 又被压回收起"（用户报的"回弹"）。
+   */
+  var railExplicitShowUntil = 0;
 
-  /** 明确请求抽屉的开/合状态，并闩锁一段时间，避免被过渡中间态翻回去。 */
-  function requestRail(hidden) {
-    railLatchUntil = Date.now() + 520;      // 略长于 260ms 的过渡
+  /**
+   * 诊断记录（`window.__dshRailDiag`）。
+   *
+   * 用户报："打开历史对话侧边栏，点右侧空白处想回对话，侧边栏莫名其妙又弹出来。"
+   *
+   * <h3>排查过程（三轮，前两轮都改错了地方，留个记录）</h3>
+   * <ol>
+   *   <li><b>第一轮</b>：判据是"祖先链里有 centerCol 才算点对话区"。
+   *       真机发现抽屉右侧常盖着**不属于 centerCol 的浮层**（提示卡），
+   *       于是判据为假 → 什么都不做 → 抽屉不收。已改成按"侧边栏右边缘之右"判定。</li>
+   *   <li><b>第二轮</b>：监听器只挂在 `document` 捕获阶段。
+   *       真机探针（tools/rail-diagnose.js）显示那个位置的元素是
+   *       **卡片里的按钮**，按钮自己 `stopPropagation` → 事件到不了 document
+   *       → 我们收不到。已加挂 `window` 捕获阶段（最先执行）。</li>
+   *   <li><b>第三轮</b>：之前为了"不依赖猜对原因"加过一个**500ms 强制保持收起**
+   *       的观察器，结果它把**用户自己再点开**也按回去了 —— 用户看到的"回弹"
+   *       其实是它造成的。已整个删除。</li>
+   * </ol>
+   * 现在这里只剩诊断记录，不再有会误伤用户操作的兜底。
+   */
+  W.__dshRailDiag = [];
+  function railDiag(what) {
+    try {
+      /*
+       * 记录调用栈（前 4 帧）。
+       * 为什么要带栈：曾经看到一条"多余的收起"却查不出是谁发起的 ——
+       * 光有时间戳和动作名，只能靠猜；带上栈就是可证的事实。
+       */
+      var st = '';
+      try {
+        var e = new Error();
+        if (e.stack) {
+          st = e.stack.split('\n').slice(2, 6)
+                .map(function (s) { return s.trim().replace(/^at\s+/, '').slice(0, 60); })
+                .join(' ← ');
+        }
+      } catch (e2) { }
+      W.__dshRailDiag.push(Date.now() + ' ' + what + (st ? '  @' + st : ''));
+      if (W.__dshRailDiag.length > 40) W.__dshRailDiag.shift();
+    } catch (e) { }
+  }
+
+  /**
+   * 「我们正在派发自己合成的点击」标志 —— **只在 `b.click()` 那一瞬为真**。
+   *
+   * ⚠️ 声明位置必须在这一层（IIFE 体内，与 requestRail / requestRailInner 同级）。
+   * 踩过的坑：我把它挪"出去"时挪错了地方，落进了 patchWindowTapToCloseRail 内部的
+   * 匿名函数里（depth=2），而使用它的 requestRailInner 在 depth=1 ——
+   * 于是赋值时抛 `railDelegating is not defined`，被 catch 吞掉，
+   * 表现就是"点了鲸鱼抽屉滑出来但内容还是窄轨道"，且**日志里看不出是异常**。
+   * （那次之所以难查：异常信息当时也没打进诊断。）
+   *
+   * 它拦住的是"我们自己合成的那一击再次进入 click 监听器"这个环
+   * （requestRailInner → 点按钮 → HTMLDocument 监听器 → requestRailInner）。
+   * 用同步标志而不是时间窗口：合成点击同步派发，置位→click→复位 就够；
+   * 真实用户事件都在之后的事件循环里，那时标志早已复位，不会误伤。
+   */
+  var railDelegating = false;
+
+  /**
+   * 请求抽屉的开/合状态。
+   *
+   * <h3>★ 第四轮（这一版）：不再自己改属性，改成"点 DSH 的按钮"</h3>
+   *
+   * 前三轮都在改 `data-dsh-rail-hidden` 这个**我们自己的**属性，然后指望
+   * DSH 跟着它走。真机时间线（tools/rail-timeline.js）证明这条路走不通：
+   *
+   * <pre>
+   * 0ms    起点 class = pI_x6G_sidebarCol
+   * 701ms  已置为收起（我们改属性）  class 仍然 = pI_x6G_sidebarCol
+   * 709ms  点了 DSH 的「打开侧边栏」
+   * 912ms  body.data-dsh-rail-hidden = null   ← 只有 DSH 的按钮会动状态
+   * 2060ms class 全程没有变过
+   * </pre>
+   *
+   * 也就是说：**DSH 的状态权威是它自己那个切换按钮，不是我们的属性**。
+   * 我们单方面改属性 → DSH 内部仍以为抽屉是开的 →
+   * 用户再点开时，DSH 把它当成"关闭"，于是抽屉纹丝不动或又被缩回去
+   * （这就是用户反复报的"回弹"）。
+   *
+   * 现在改成**委托**：请求什么状态，就去点 DSH 对应的那个按钮，
+   * 让它自己把状态和动画走完；我们的属性只由下面那个 observer 跟随它。
+   *
+   * @param hidden true=收起, false=展开
+   * @param fromUser 是否用户直接发起（用户发起时优先，不被自动同步压回）
+   */
+  function requestRail(hidden, fromUser) {
+    /*
+     * 第七轮起**不再需要任何闩锁**：状态只有 DSH 一个来源，
+     * 我们不再"压住"任何东西，也就没有需要防的中间态误判。
+     * （railLatchUntil / railExplicitShowUntil 两个变量保留仅为兼容旧引用，
+     *   代码里已不参与任何判断。）
+     */
+
+    /*
+     * ★ 重入闸门（第六轮，最后一块拼图）。
+     *
+     * 下面会去 `b.click()` 点 DSH 的按钮 —— 而那一击**同样会经过我们自己的
+     * click 监听器**（真机栈里看得很清楚：
+     *   requestRail ← HTMLDocument.<anonymous> ← requestRail ← railPointerHandler）。
+     * 于是"我们收一次 → 触发 DSH 切换 → 又被我们当成用户点击再收一次"，
+     * 一个切换动作被做了两遍，抽屉就是收了又开／开了又收 —— 用户看到的"回弹"。
+     *
+     * ⚠️ 这里**不能**用一个"执行期间为真"的开关：我们的合成点击是**同步**派发的，
+     * 而真实用户点击可能恰好排在同一段脚本里 —— 那样会把用户的点击也一起挡掉
+     * （实测：用户点空白完全没反应，因为连"收起"都被自己的闸门吃了）。
+     * 正确做法是**只在合成点击那一瞬间**放行/拦截，用时间戳标记，
+     * 监听器看到"刚刚是我们自己合成的那一击"就跳过。
+     */
+    return requestRailInner(hidden, fromUser);
+  }
+
+  /**
+   * 找 DSH 自己的抽屉切换按钮。
+   *
+   * <h3>为什么要单独抽出来、还要多路兜底</h3>
+   * 0.3.9 里 `requestRail` 找不到按钮就"静默不做事"，结果用户装了之后
+   * **侧边栏完全打不开** —— 一个查不到元素就让核心功能全废，不可接受。
+   * 所以这里：三种选择器依次试，并返回"找到了哪个"供诊断。
+   *
+   * @param hidden true 表示想要"收起"，对应按钮标签是「收起侧边栏」
+   */
+  function findRailToggle(hidden) {
+    var want = hidden ? '收起侧边栏' : '打开侧边栏';
+    var sels = [
+      '[class*="sidebarCol"] button[aria-label*="' + want + '"]',
+      '[class*="logoRow"] button[aria-label*="侧边栏"]',
+      'button[aria-label*="' + want + '"]'
+    ];
+    for (var i = 0; i < sels.length; i++) {
+      try {
+        var el = document.querySelector(sels[i]);
+        if (el) return { btn: el, via: sels[i] };
+      } catch (e) { }
+    }
+    /*
+     * 最后兜底：任意一个"侧边栏"切换按钮，**按它的标签判断语义**。
+     * 只有当它的语义与目标一致时才用（否则会把状态点反）。
+     */
+    try {
+      var all = document.querySelectorAll('button[aria-label*="侧边栏"]');
+      for (var j = 0; j < all.length; j++) {
+        var lbl = all[j].getAttribute('aria-label') || '';
+        if ((hidden && lbl.indexOf('收起') >= 0) || (!hidden && lbl.indexOf('打开') >= 0)) {
+          return { btn: all[j], via: 'any+label(' + lbl + ')' };
+        }
+      }
+    } catch (e2) { }
+    return null;
+  }
+
+  function requestRailInner(hidden, fromUser) {
+    /*
+     * ★★★ 第八轮定稿（真机逐帧实测之后）：**真相就是我们这个属性**。
+     *
+     * 第七轮我按"只留 DSH 一套状态"改成委托点击 + 按按钮标签镜像，
+     * 结果用户报"抽屉连开都开不了 / 开了关不掉"。用 tools/rail-who-moves.js
+     * 逐帧量出了铁证：
+     *
+     *   我们设 attr=1          → tx = -280   抽屉真的收起 ✅
+     *   我们清掉 attr          → tx = 0      抽屉真的展开 ✅
+     *   点 DSH 自己的切换按钮  → tx 恒为 0   抽屉**一动不动**，只有按钮标签翻转 ❌
+     *
+     * 也就是说：**抽屉的位移已经完全由我们的 CSS（认 body[data-dsh-rail-hidden]）
+     * 控制，DSH 的开合状态不再影响它**。所以第七轮那个"按按钮标签镜像"的前提是错的
+     * —— 按钮标签跟画面根本不对应，照着它写属性必然把画面写反。
+     *
+     * 现在只有一份真相：`body[data-dsh-rail-hidden]`。
+     *   · requestRail 直接写它（同步、立刻生效、可被工具单独验证）；
+     *   · 写完**顺带**把 DSH 的按钮点一下，让它的标签跟上 ——
+     *     这一步是"顺手对齐"，失败了也不影响画面（画面只认属性）。
+     *     只有"标签与目标不一致"时才点，否则会把 DSH 状态翻反。
+     */
+    var want = hidden ? '1' : '0';
+    var cur = document.body.getAttribute('data-dsh-rail-hidden');
+    if (cur === want) {
+      railDiag('requestRail(' + (hidden ? 'hide' : 'show') + ') → 已是目标状态，无动作');
+      return true;
+    }
+
+    /* ① 唯一真相：直接写。这是**画面实际认的**那个开关 */
     if (hidden) document.body.setAttribute('data-dsh-rail-hidden', '1');
     else document.body.removeAttribute('data-dsh-rail-hidden');
+    railDiag('requestRail(' + (hidden ? 'hide' : 'show') + ') → 已写属性（画面认这个）');
+
+    /*
+     * ★★★ ② 让 **DSH 也走到同一状态** —— 这一步不是"顺手对齐"，是**必须的**。
+     *
+     * 【本次线上报障的根因】用户点浮动鲸鱼，抽屉滑出来了，但**里面只有一列图标**
+     * （会话列表没有，`treeitem` 数 = 0），看起来就是"大抽屉/空抽屉"。
+     *
+     * 原因：我们把抽屉的**位移**交给自己的 CSS（认 body[data-dsh-rail-hidden]），
+     * 但**内容由 DSH 渲染** —— 它靠内部类名 `hHd-Xa_collapsed` 决定渲染"窄轨道"还是"完整抽屉"。
+     * 只写我们的属性只会滑动，DSH 仍带 `collapsed`，于是渲染窄轨道。
+     *
+     * 逐帧实测（tools/rail-collapsed-probe.js）证据：
+     *   起点(收起)   collapsed类=root collapsed quietBars   attr=1  会话项=0
+     *   点DSH按钮+200ms  collapsed类=root quietBars          attr=   会话项=6  ← 内容出来了
+     *
+     * 所以必须点它自己的切换按钮，把 `collapsed` 摘掉/加回。
+     *
+     * ⚠️ 上一轮我删掉过这一步，因为"每次都把状态翻反"。真正的原因是：
+     *   · 我用 `findRailToggle(!hidden)` 找按钮，语义正好相反；
+     *   · 而且按钮标签与画面不同步，按标签判方向必然出错。
+     * 现在改成**按当前类名判方向**：只有"DSH 的状态与目标不符"时才点，
+     * 且找按钮时**不看标签**（那玩意不可靠），取 DOM 里那颗切换按钮即可。
+     *
+     * 用 railDelegating 包住这一击：它会再次进入我们自己的 click 监听器，
+     * 不拦住就会翻两次（历史踩过）。点击是同步的，标志在事件循环内复位，
+     * 真实用户事件不会被误伤。
+     */
+    try {
+      /*
+       * ⚠️ 选择器**必须限定在侧边栏内**（`[class*="sidebarCol"] ` 前缀）。
+       *
+       * 踩过的坑：原来写的是 `document.querySelector('[class*="hHd-Xa_root"]')`，
+       * 而**我们注入的浮动鲸鱼按钮内部也带这个类**（复用了 DSH 侧边栏的图标 HTML）。
+       * 冷启动时侧边栏还没渲染，于是选到了浮按钮里那个 —— 它**不含 collapsed**，
+       * 于是读到 dshCollapsed=false → 判定"无需翻转" → **DSH 永远停在收起**，
+       * 抽屉滑出来了但内容只有一列图标（用户看到的"大抽屉/空抽屉"）。
+       *
+       * 这个 bug 之所以难查：读错了元素却**不报错**，只是静默不动作。
+       * 所以下面每一步都留痕，catch 里也留痕（不再吞异常）。
+       */
+      var rootEl = document.querySelector('[class*="sidebarCol"] [class*="hHd-Xa_root"]');
+      var dshCollapsed = !!(rootEl && rootEl.className.indexOf('collapsed') >= 0);
+      /* 我们要收起 → DSH 应当处于 collapsed；要展开 → 不应处于 collapsed */
+      var needFlip = (hidden !== dshCollapsed);
+      railDiag('  ↳ DSH同步检查: rootEl=' + (rootEl ? 'ok' : 'null')
+               + ' dshCollapsed=' + dshCollapsed + ' 目标hidden=' + hidden
+               + ' needFlip=' + needFlip);
+      if (needFlip) {
+        var tog = (rootEl && rootEl.querySelector('button[aria-label*="侧边栏"]'))
+               || document.querySelector('[class*="sidebarCol"] button[aria-label*="侧边栏"]')
+               || document.querySelector('button[aria-label*="侧边栏"]');
+        railDiag('  ↳ 找到切换按钮: ' + (tog ? ((tog.getAttribute('aria-label') || tog.tagName)) : 'null'));
+        if (tog) {
+          var prevD = railDelegating;
+          railDelegating = true;
+          try { tog.click(); } finally { railDelegating = prevD; }
+          railDiag('  ↳ 已同步 DSH 内容状态（' + (hidden ? '收起' : '展开') + '）');
+        } else {
+          railDiag('  ↳ 找不到 DSH 切换按钮，内容状态未同步');
+        }
+      } else {
+        railDiag('  ↳ DSH 内容状态已一致，无需翻转');
+      }
+    } catch (e) {
+      railDiag('  ↳ DSH同步异常: ' + (e && e.message ? e.message : e));
+    }
+    return true;
   }
 
   /** 收起抽屉：复用 DSH 自己的「收起侧边栏」按钮。 */
@@ -754,6 +1070,8 @@
     if (W.__dshDrawerAutoClose) return;
     W.__dshDrawerAutoClose = true;
     document.addEventListener('click', function (ev) {
+      // 我们自己派发的那一击（requestRail 去点 DSH 按钮）—— 不算用户操作
+      if (railDelegating) return;
       var t = ev.target;
       if (!t || !t.closest) return;
       /*
@@ -764,14 +1082,11 @@
       if (W.__dshHoldDrawer) return;
 
       /*
-       * 抽屉里的「收起侧边栏」：**立刻**切到收起态。
-       * 同上，不能等 MutationObserver 的 150ms 去抖，否则点一下要顿一下才动。
-       * 用精确匹配，避免误伤「收起右侧边栏」。
+       * 说明：侧边栏切换按钮（打开/收起侧边栏）的接管**不在这里** ——
+       * 因为 railTapHandler 里那条"抽屉里的点击直接 return"更早执行，
+       * 写在这里永远不会被调用（踩过）。它现在位于 railTapHandler 内部、
+       * 在那条 return **之前**，见那里的注释。
        */
-      if (t.closest('[class*="sidebarCol"] button[aria-label="收起侧边栏"]')) {
-        requestRail(true);
-        return;
-      }
 
       var side = t.closest('[class*="sidebarCol"]');
       if (!side) return;
@@ -820,6 +1135,330 @@
       // 先让 DSH 完成切换/开弹窗，再收起抽屉
       setTimeout(collapseRail, 80);
     }, true);
+  }
+
+  /**
+   * 抽屉打开时，点右边那块"对话区"也要能收起来 —— 用户要的是"点回去就回原会话"。
+   *
+   * <h3>为什么需要它</h3>
+   * patchDrawerAutoClose 只认**抽屉内部**的点击（选会话/新建会话）。用户的手势是
+   * "划出会话列表看一眼，然后直接点右边那块对话区想回去"，而那块区域点下去
+   * 什么都不会发生，看起来就是"点了没反应、退不回原来的会话"。
+   * 用户原话："调出会话列表后点击右侧会话区域无法回退至原会话"。
+   *
+   * <h3>为什么只认 centerCol</h3>
+   * `[class*="centerCol"]` 是中间栏（对话正文），它是"右边那块"最稳的锚点：
+   *   · 抽屉在 sidebarCol 里，点它不会命中 centerCol；
+   *   · 鲸鱼按钮、右侧栏都在 centerCol 之外，所以不会被误伤；
+   *   · 平板上 centerCol 常驻可见（没有抽屉这回事），所以本函数**只在窄屏 + 抽屉打开时**生效。
+   *
+   * <h3>⚠️ "抽屉开着"的判据（这里栽过一次，别再写反）</h3>
+   * `body[data-dsh-rail-hidden]` = **抽屉已经收起**（名字就是"轨道被藏起来"）。
+   * 第一版把它当成"抽屉开着"，于是 `if (!hasAttribute(...)) return;` 在正常情况下
+   * 直接返回 —— 真机 CDP 实测点下去毫无反应，而代码看起来完全"合理"。
+   *
+   * <h3>为什么不能只看宽度</h3>
+   * 真机实测（360dp 宽、抽屉 280dp）：抽屉**收起后 `sidebarCol` 的宽度仍然是 280** ——
+   * 它是靠 `translateX(-280)` 移出屏幕的（点开后 `getBoundingClientRect().x` 从
+   * -280 变 0）。所以"宽度 ≥ 200 就算开着"会把收起态误判成打开，
+   * 于是点侧边栏反而把抽屉**拉开** —— 比不修还糟。
+   * 现在改成：① 用户动作后的闩锁期用我们自己的状态；② 闩锁到期后用
+   * `elementFromPoint` 直接看"抽屉原来占的那块位置"露出来的是谁 —— 这是几何事实，
+   * 不依赖任何类名或宽度假设。
+   *
+   * <h3>为什么不用遮罩</h3>
+   * 加一层半透明遮罩 + 点击关闭是最常见的写法，但这里行不通：抽屉下的内容
+   * 仍然要能被 DSH 自己正常收到事件（比如点会话行切换），遮罩会把它们吃掉。
+   * 事件委托不改 DOM 结构，风险最小 —— 宁可少改，也不要加不可靠的判断逻辑。
+   */
+  function drawerOpen() {
+    var side = document.querySelector('[class*="sidebarCol"]');
+    if (!side) return false;
+    /*
+     * ★ 唯一真相：这个属性。
+     *
+     * 逐帧实测（tools/rail-who-moves.js）确认：
+     *   设 attr=1 → tx=-280（真收起）；清掉 → tx=0（真展开）；
+     *   而点 DSH 自己的按钮 20 次，tx 恒为 0 —— 它的状态**不驱动画面**。
+     * 所以画面状态只能由这个属性表达，别再去读 DSH 的按钮标签。
+     */
+    return !document.body.hasAttribute('data-dsh-rail-hidden');
+  }
+
+  function patchWindowTapToCloseRail() {
+    if (W.__dshTapCloseRail) return;
+    W.__dshTapCloseRail = true;
+
+    /*
+     * ★ 点击取证日志（`window.__dshClickLog`）。
+     *
+     * 用户反馈"点侧边栏的关闭按钮关不掉"。我无法看到他的屏幕，
+     * 而他点的到底是哪个元素（DSH 的切换按钮？注入的鲸鱼按钮？某个插件按钮？）
+     * 直接决定该改哪里。之前只能靠猜，代价是改了五轮都没中。
+     *
+     * 所以这里把所有点击记下来（最多 30 条）：点到了谁、坐标、当时抽屉是开是关、
+     * 以及那一击有没有被当作"收抽屉"处理。出问题时报一条命令就能看现场：
+     *   node tools/cdp.mjs --file tools/rail-clicklog.js
+     */
+    if (!W.__dshClickLog) {
+      W.__dshClickLog = [];
+      W.addEventListener('click', function (ev) {
+        try {
+          var t = ev.target;
+          var el = t && t.closest ? (t.closest('button,[role="button"],a') || t) : t;
+          var lbl = el && el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+          W.__dshClickLog.push({
+            t: Date.now() % 1000000,
+            tag: el ? el.tagName : '',
+            id: el ? (el.id || '') : '',
+            cls: el ? (el.className || '').toString().slice(0, 34) : '',
+            aria: lbl.slice(0, 24),
+            x: Math.round(ev.clientX), y: Math.round(ev.clientY),
+            inSide: !!(t && t.closest && t.closest('[class*="sidebarCol"]')),
+            railHidden: document.body.getAttribute('data-dsh-rail-hidden') === '1',
+          });
+          if (W.__dshClickLog.length > 30) W.__dshClickLog.shift();
+        } catch (e) { }
+      }, true);
+    }
+    /**
+     * 「刚刚点过抽屉切换按钮」的冷却时间。
+     *
+     * 起因（真机时间线实测）：我们收起抽屉是**直接改 body 属性**，
+     * 而 DSH 的按钮状态是它自己那边维护的 —— 两者的内部状态**不会自动对齐**。
+     * 于是"收起后马上再点开"时，DSH 仍以为抽屉是开的，
+     * 那一下点击被它当成"关闭"处理，用户看到的就是"点了不弹出来 / 回弹"。
+     *
+     * 这个冷却只做一件事：**极短时间内不重复转发**同一次连点，
+     * 避免和 DSH 正在跑的过渡打架。真正的状态权威仍然交给 DSH 自己。
+     */
+    var railToggleCooldownUntil = 0;
+
+    /**
+     * 最近一次"收起抽屉"动作的时间戳 —— 用来给 click 与 pointerup 去重。
+     *
+     * 同一次触摸会先来 pointerup、再来 click（或反之，取决于浏览器是否把 click 抑制掉），
+     * 两个监听器都会尝试收一次；不去重就会收两次，
+     * 加上"收起"会委托点击 DSH 的按钮（这是个**切换**），第二次就把抽屉又打开了
+     * —— 现象正是用户反复报的"回弹"。
+     */
+    var railLastTapAt = 0;
+
+  /**
+   * 「我们正在派发自己合成的点击」标志 —— **只在 `b.click()` 那一瞬为真**。
+   *
+   * <h3>为什么必须是同步的一瞬，而不是一段时间窗口</h3>
+   * requestRail 会去点 DSH 的按钮，而那一击**会再次进入我们自己的 click 监听器**
+   * （带调用栈的 __dshRailDiag 抓到的环：
+   *   requestRailInner → 点按钮 → HTMLDocument 监听器 → requestRailInner → …）。
+   * 不拦住就会把一次切换做成两次，用户感受就是**点按钮关不掉抽屉**。
+   *
+   * 但拦的窗口**不能是一段时间**（时间戳版本踩过：紧随其后的真实 pointerup
+   * 落进 60ms 窗口被忽略，点空白完全没反应）。我们的合成点击是**同步派发**的，
+   * 所以只要在 `click()` 前后置位/清位即可 —— 真实事件都在之后的事件循环里，
+   * 那时标志早已复位，绝不会被误伤。
+   */
+
+  /**
+   * 「这个点击事件已经处理过」—— 用**事件对象引用**去重。
+   *
+   * 见 railTapHandler 的说明：handler 同时挂在 window 与 document 捕获阶段，
+   * 一次点击会进来两次，两次判定基准不同会互相抵消。
+   *
+   * 为什么不用 ev.timeStamp：合成点击会复用同一个时间戳，
+   * 导致后续点击被误判成"已处理"而完全失效（实测踩到）。
+   * 同一次派发传给两个监听器的是同一个事件对象 —— 引用比对才可靠。
+   */
+  var railHandledEv = null;
+    /*
+     * ★ 为什么在 window 和 document 上**都挂**（且都用捕获阶段）：
+     *
+     * window 的捕获阶段是整条传播链的**最外层、最先执行**的位置。
+     * 真机实测（tools/rail-diagnose.js 的探针）：抽屉右侧那块经常盖着
+     * 卡片里的按钮（例如提示卡上的主按钮），按钮自己的处理里调了 stopPropagation ——
+     * 于是事件**冒泡不到 document**，我们挂在 document 上的监听器收不到，
+     * 表现就是"点空白回不去 / 点了没反应"。
+     * 挂到 window 捕获阶段就不受它影响（我们最先跑）。
+     *
+     * 同一次点击会被这两个监听器各调用一次，但 handler 是幂等的：
+     * 第一次就已把抽屉收起并 stopImmediatePropagation，
+     * 第二次进来时 drawerOpen() 已经为假，直接返回。
+     */
+    function railTapHandler(ev) {
+      // 我们自己派发的那一击（requestRail 去点 DSH 按钮产生的）—— 不能再当用户点击处理
+      if (railDelegating) return;
+      /*
+       * ★★★ 去重：同一次派发只处理一次。
+       *
+       * 这是"关不掉"的**真正根因之一**（找了很久）：
+       * 这个 handler 同时挂在 `window` 和 `document` 的捕获阶段，
+       * 于是**一次点击会进来两次**。两次都会重新算 `wantHide = drawerOpen()` ——
+       * 第一次算"收起"并执行，第二次基于**变化后**的状态算成"展开"，正好抵消。
+       *
+       * ⚠️ 不能用 `ev.timeStamp` 当指纹：实测合成点击（el.click()）会**复用同一个
+       * 时间戳**，于是第 2 次起的点击全被误判成"已处理"，处理器再也不跑
+       * （现象：点一次有效，之后完全没反应，railDiag 也不再增长）。
+       * 改用**引用比对**：同一次派发传给两个监听器的是**同一个事件对象**，
+       * 引用相同即同一次；不同点击的事件对象必然不同。
+       */
+      if (ev === railHandledEv) return;
+      railHandledEv = ev;
+      // 编排抽屉期间（插件页返回那条路）不许收 —— 否则一开一合太乱
+      if (W.__dshHoldDrawer) return;
+      if (window.innerWidth >= NARROW_PX) return;   // 平板没有抽屉
+      var t = ev.target;
+      if (!t || !t.closest) return;
+
+      /*
+       * ★★★ 第一优先：侧边栏切换按钮的接管。
+       *
+       * 这里**必须在下面那条 `if (!drawerOpen()) return;` 之前** ——
+       * 那条守卫是给"点空白收起"用的（"抽屉本来就是收起的，没什么可收"），
+       * 但它会把**抽屉收起时点切换按钮**也一并挡掉，于是永远打不开。
+       * 实测（tools/rail-guard-trace.js）逐条复刻守卫链才定位到：
+       *   drawerOpen=False → 直接 return，接管代码根本没机会执行。
+       * 这个顺序错误我先后踩了两次（另一次是把它写在 patchDrawerAutoClose 里），
+       * 所以现在把它放在**所有守卫之后的第一件事**。
+       *
+       * 为什么必须接管：取证日志（window.__dshClickLog）显示用户点的"关闭按钮"是
+       *   BUTTON.hHd-Xa_iconButton.hHd-Xa_toggle
+       * 它被我们自己的 CSS 弄成 [0,0,0,0]（收起时）或 28x28（展开时），
+       * 而且 **DSH 的状态不驱动画面**（逐帧实测点它 20 次 tx 都是 0）——
+       * 点它什么都不会发生，这就是"打不开 / 关不掉"。
+       */
+      var railToggle = t.closest('[class*="sidebarCol"] button[aria-label*="侧边栏"]');
+      if (railToggle) {
+        var rl = railToggle.getAttribute('aria-label') || '';
+        /*
+         * 开关语义：**当前开着 → 这一击应当收起**，即 wantHide = drawerOpen()。
+         * ⚠️ 这里我写错过一次（写成 !drawerOpen()），现象是"点关闭反而想展开"，
+         * 抽屉纹丝不动。布尔值写反靠读代码很容易漏，所以保留打出方向的诊断。
+         */
+        var wantHide = drawerOpen();
+        railDiag('侧边栏切换按钮被点: aria=' + rl + ' → ' + (wantHide ? '收起' : '展开'));
+        requestRail(wantHide, true);
+        return;
+      }
+
+      // 以下是"点空白收起"的路径：抽屉本来就是收起的话没什么可收
+      if (!drawerOpen()) return;
+
+      /*
+       * 说明：侧边栏切换按钮的接管已经**提到所有守卫之前**（见本函数上方），
+       * 那里是有注释说明的正式位置。这里保持"其余抽屉内点击交给
+       * patchDrawerAutoClose 判"的原逻辑即可。
+       */
+
+      // 抽屉里的其它点击交给 patchDrawerAutoClose 判（它有"点会话行才收"的细分规则）
+      if (t.closest('[class*="sidebarCol"]')) return;
+      // 兜底：从抽屉里长按/拖出去的浮层也不该被动到
+      if (t.closest('[role="dialog"]')) return;
+
+      /*
+       * ★ 判据是"**点在侧边栏右侧那块可见区域**"，不是"祖先链里有 centerCol"。
+       *
+       * 这一条是真实触摸测出来的（改之前用假事件测，一直测不出来）：
+       * 屏幕上经常盖着**不属于 centerCol 的浮层** —— 例如底部那张提示卡
+       * （`uV2eYG_card`，祖先链是 root/row/card，压根没有 centerCol）。
+       * 用户在它上面点一下，旧的判据判定"这不是对话区"，于是**什么都不做**，
+       * 抽屉就一直开着 —— 用户看到的就是"点空白处回不去／像又弹回来了"。
+       *
+       * 新判据只要求两件事，都不依赖 DOM 结构：
+       *   · 抽屉开着（上面已判）；
+       *   · 点落在侧边栏**右边缘之右**、且在当前视口内。
+       * 结构怎么嵌套、上面盖着什么，都不影响 —— 这正是我们要的"点对话区就收"。
+       */
+      var side = document.querySelector('[class*="sidebarCol"]');
+      if (!side) return;
+      var sr = side.getBoundingClientRect();
+      /*
+       * 用"坐标"判定，但**两个层次都试**：
+       *
+       *   ① 真实触摸：ev.clientX/Y 是准的 → 直接按"在侧边栏右边缘之右"判；
+       *   ② 合成事件/工具注入：有些途径（例如 CDP 的 Input.dispatchTouchEvent
+       *      之外的手工构造）会给出 0,0 坐标，此时**退回 DOM 判据**
+       *      （祖先链里有 centerCol 就算点在对话区）。
+       *
+       * 为什么要留 ②：真机排查时我一度用 0,0 的合成点击做验证，
+       * 结果因为坐标是 0 而被坐标判据排除，误判成"监听器没挂上"，
+       * 白查了一轮。两个层次都判之后，任何注入方式都能得到一致结果。
+       */
+      var byCoord = (ev.clientX > sr.right + 2)
+                 && ev.clientY >= 0 && ev.clientY <= window.innerHeight
+                 && ev.clientX >= 0 && ev.clientX <= window.innerWidth;
+      var byDom = false;
+      if (!byCoord && ev.clientX === 0 && ev.clientY === 0) {
+        byDom = !!(t.closest('[class*="centerCol"]'));
+      }
+      if (!byCoord && !byDom) return;      // 落在抽屉里（或边界上）→ 不碰
+
+      /*
+       * 【为什么必须 stopPropagation —— 用户报的"侧边栏莫名弹回来"】
+       *
+       * 这段监听器挂在**捕获阶段**（第三个参数 true），比 DSH 自己的 click 处理**先**跑。
+       * 第一版只调了 requestRail(true) 就放事件继续往下传，于是 DSH 的处理器随后跑，
+       * 它看到"抽屉此刻是收起的"就把这次点击当成"切换抽屉" → **又把它打开**。
+       * 用户看到的现象就是：点右侧空白处想回对话，结果侧边栏弹出来。
+       *
+       * 修法：这次点击的语义已经被我们消费掉（"点空白处 = 收抽屉"），
+       * 就别再让它进入 DSH 的处理链。stopImmediatePropagation 连同一元素上
+       * 其它监听器一起挡住。
+       *
+       * 注意**不用 preventDefault** —— 收抽屉不该改变 DSH 对这次点击的默认行为
+       * （输入框失焦、取消文本选择这些），阻止它反而会出现"点了没反应"。
+       */
+      /*
+       * 收起抽屉 —— 交给 requestRail，它现在会去点 DSH 自己的按钮，
+       * 让"状态权威"只有 DSH 一个（见 requestRail 的第四轮说明）。
+       * 这里**不要**再自己改属性或再点一次按钮，否则会点两次把状态翻过去。
+       */
+      if (Date.now() - railLastTapAt < 450) {
+        // 同一次触摸的 pointerup 已经收过了 —— 再来一次会把抽屉又切换回来
+        ev.stopImmediatePropagation();
+        ev.stopPropagation();
+        return;
+      }
+      railLastTapAt = Date.now();
+      requestRail(true, true);
+      ev.stopImmediatePropagation();
+      ev.stopPropagation();
+    }
+
+    /*
+     * ★ pointerup 兜底：真机实测发现，抽屉右侧那块如果落在一个**按钮**上
+     * （探针里是卡片内的 `BUTTON.uV2eYG_primary`），那次触摸**根本不产生 click** ——
+     * 按钮的处理把 click 抑制掉了。于是挂在 click 上的监听器（无论冒泡还是捕获）
+     * 都收不到，用户感受就是"点了没反应"。
+     *
+     * pointerup 不会被这样抑制，用它兜底最稳。
+     *
+     * ⚠️ 但 pointerup 与 click 是**同一次触摸的两个事件**，必须防止同一次被处理两遍：
+     * 真机诊断（带调用栈的 __dshRailDiag）抓到过这样的序列 ——
+     * click 先把抽屉收起，紧接着同一次触摸的 pointerup 又来一次，
+     * 于是"收起→又收起"或"展开→又被收起"，看上去就是回弹。
+     * 下面用 railLastTapAt 做去重：一次触摸只认第一个到达的事件。
+     */
+    function railPointerHandler(ev) {
+      if (railDelegating) return;                     // 我们自己派发的那一击
+      if (W.__dshHoldDrawer) return;
+      if (window.innerWidth >= NARROW_PX) return;
+      if (Date.now() - railLastTapAt < 450) return;   // 同一次触摸的另一个事件，忽略
+      if (!drawerOpen()) return;
+      var t2 = ev.target;
+      if (t2 && t2.closest && t2.closest('[class*="sidebarCol"]')) return;
+      if (t2 && t2.closest && t2.closest('[role="dialog"]')) return;
+      var s2 = document.querySelector('[class*="sidebarCol"]');
+      if (!s2) return;
+      if (ev.clientX <= s2.getBoundingClientRect().right + 2) return;
+      if (ev.clientY < 0 || ev.clientY > window.innerHeight) return;
+      railLastTapAt = Date.now();
+      requestRail(true, true);
+    }
+
+    // window 捕获（最先执行，扛得住内层 stopPropagation）+ document 捕获（兜底）
+    W.addEventListener('click', railTapHandler, true);
+    document.addEventListener('click', railTapHandler, true);
+    W.addEventListener('pointerup', railPointerHandler, true);
   }
 
   /*
@@ -1302,6 +1941,8 @@
      * __dshConsumed 标记，是给后者读的。
      */
     patchDrawerAutoClose();
+    // 点右边那块会话区域 → 收起抽屉回原会话（用户反馈的第一个问题）
+    patchWindowTapToCloseRail();
     patchQuestionCard();
 
     var dlg = settingsDialog();
@@ -1641,56 +2282,6 @@
       setTimeout(tick, 1200);
     }
     setTimeout(tick, 1500);
-  })();
-
-  /*
-   * 【用途守卫：扫到"明显违法用途"就交给 App 弹一次警告】
-   *
-   * 边界（与 App 侧 Guard.java 一致）：纯本地判断、不上报、不阻止；
-   * 关键词表由 App 提供（DshAndroid.guardPatterns），所以改词不用动这个补丁。
-   * 只在文本变化时扫，且最多 5 秒一次 —— 不做无谓的整页 innerText。
-   *
-   * 注意：它以前挂在「语音播报」那个 IIFE 里（因为那个 IIFE 也是 2 秒 tick 一次）。
-   * 语音整块撤掉之后必须**独立出来**，否则守卫会跟着一起消失。
-   */
-  (function misuseGuard() {
-    if (!W.DshAndroid || !W.DshAndroid.misuseDetected) return;
-
-    var rules = null;
-    var lastScan = 0;
-    var lastText = '';
-
-    function scan() {
-      var now = Date.now();
-      if (now - lastScan < 5000) return;
-      lastScan = now;
-      if (rules === null) {
-        try { rules = JSON.parse(W.DshAndroid.guardPatterns() || '[]'); }
-        catch (e) { rules = []; }
-      }
-      if (!rules.length) return;
-      var body = (document.body && document.body.innerText) || '';
-      if (body.length === lastText.length) return;      // 文本没变就不重复扫
-      lastText = body;
-      for (var i = 0; i < rules.length; i++) {
-        var r = rules[i];
-        if (r && r.k && body.indexOf(r.k) >= 0) {
-          lastScan = now + 3600000;                     // 命中后本页不再重复触发
-          try { W.DshAndroid.misuseDetected(r.k, r.w || ''); } catch (e) { }
-          return;
-        }
-      }
-    }
-
-    try {
-      if (document.documentElement) {
-        new MutationObserver(function () {
-          try { scan(); } catch (e) { }
-        }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-      }
-    } catch (e) { }
-    setInterval(function () { try { scan(); } catch (e) { } }, 5000);
-    setTimeout(scan, 2000);
   })();
 
   /*

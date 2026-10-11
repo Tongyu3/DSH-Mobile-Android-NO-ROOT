@@ -8,6 +8,19 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <!--
+      悬浮窗（DSH 悬浮窗）：让 DSH 界面能浮在别的应用之上。
+      这是 appop 型特殊权限，**不能用 requestPermissions 申请**，
+      只能在运行时检查 Settings.canDrawOverlays() 并跳到
+      ACTION_MANAGE_OVERLAY_PERMISSION 让用户手动打开 —— 见 OverlayService。
+
+      ⚠️ 窗口里**绝不能加 FLAG_NOT_FOCUSABLE**：加了以后这个窗口永远不会
+      成为输入法目标，DSH 的输入框就再也弹不出软键盘（只能看不能打字）。
+      代价是浮层持有焦点，用 FLAG_NOT_TOUCH_MODAL 保证窗口外的触摸
+      仍然落到下面的应用上。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!--
       读写手机共享存储，让容器里的 DSH 能像文件管理器一样操作手机文件。
       之所以可行：本 App 的 targetSdk = 28（为 W^X 豁免而选），
       Android 11+ 对 targetSdk ≤ 29 的应用仍沿用**旧版存储模型**，
@@ -53,11 +66,13 @@
 
     <!-- DSH Web UI 走 http://127.0.0.1:<port>，需要允许明文回环流量 -->
     <application
+        android:name=".DshApp"
         android:label="@string/app_name"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:requestLegacyExternalStorage="true"
         android:usesCleartextTraffic="true"
+        android:largeHeap="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <!--
@@ -74,6 +89,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density|fontScale|layoutDirection|locale|mcc|mnc|touchscreen"
             android:label="@string/app_name" />
 
         <!--
@@ -624,9 +640,22 @@
             </intent-filter>
         </activity-alias>
 
-        <!-- 常驻服务：维持 dsh web 进程。targetSdk 28 故无需 foregroundServiceType。 -->
+        <!--
+          常驻服务：维持 dsh web 进程。targetSdk 28 故无需 foregroundServiceType。
+          stopWithTask="false"：用户把 App 从最近任务划掉时**不跟着死** ——
+          划掉卡片是"不想看界面"，不是"关掉容器"（见 DshService.onTaskRemoved）。
+        -->
         <service
             android:name=".DshService"
+            android:exported="false"
+            android:stopWithTask="false" />
+
+        <!--
+          DSH 悬浮窗：在其他应用之上显示一个可交互的 DSH 界面（覆层窗口）。
+          必须先是前台服务再 addView —— Android 14+ 会移除"非前台服务添加的 overlay 窗口"。
+        -->
+        <service
+            android:name=".OverlayService"
             android:exported="false" />
 
         <!--
@@ -646,6 +675,12 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
+
+        <!-- 悬浮球图标选择（换图标不用重启 App，所以这页很轻） -->
+        <activity
+            android:name=".BallIconActivity"
+            android:exported="false"
+            android:label="悬浮球图标" />
 
         <!-- 白名单配置界面 -->
         <activity

@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.system.Os;
 import android.util.Log;
 import android.view.View;
@@ -68,6 +69,124 @@ public class MainActivity extends Activity {
     /** 顶部状态栏整行；DSH 就绪后会整条隐藏，避免常年遮挡视野。 */
     private LinearLayout topBar;
     private WebView webView;
+    /** 开屏动画（工业简约风）。见 {@link TdshSplashView} 与 {@link #dismissSplash()}。 */
+    private TdshSplashView splash;
+    /** 开屏是从什么时候开始显示的 —— 用来保证"至少露一下脸"，不做无谓闪烁。 */
+    private long splashShownAt = 0L;
+    /**
+     * 开屏最短显示时长。
+     *
+     * <p>必须装得下**整套分镜**，否则动画会被拦腰切断 —— 用户就看不到"点→线→面"
+     * 与收尾那一缩。节奏是：生长 0.55(点) + 0.45(线) + 0.65(面) = 1.65s，
+     * 加收尾 0.76s ≈ 2.4s。原来只有 0.9s，**点还没看清就被切走了**
+     * （用户反馈"开始的点没有显示，直接就到空心线条了"）。
+     */
+    /*
+     * 开屏最短展示时长 = 生长 1.65s + 收尾倒放 1.70s ≈ 3.35s。
+     *
+     * 必须装得下**整套分镜**（含收尾那段倒放：直角→矩形→空心线→点），
+     * 否则动画会被拦腰切断，用户就看不到"返回的过程"。
+     */
+    private static final long SPLASH_MIN_MS = 3400L;
+    /**
+     * 开屏的**硬上限**：超过这个时间无论启动到哪一步都强制收起。
+     *
+     * <p>为什么要有：这块动画盖着启动日志与「重试」按钮。
+     * 万一就绪回调因为任何原因没来（插件卡死、容器挂住、WebView 起不来），
+     * 用户至少还能看到日志、点重试 —— 而不是盯着一个永远在转的开屏。
+     */
+    private static final long SPLASH_MAX_MS = 45000L;
+
+    /** 开屏底色（深色主题）—— 与 {@link TdshSplashView} 里 THEME_DARK 的 bg 保持一致。 */
+    private static final int SPLASH_BG_DARK = 0xFF0B0E10;
+    /** 开屏底色（浅色主题）—— 与 THEME_LIGHT 的 bg 一致。 */
+    private static final int SPLASH_BG_LIGHT = 0xFFEDEEEA;
+
+    /** 当前系统是否是浅色模式（决定开屏用哪套配色）。 */
+    private boolean systemIsLight() {
+        return (getResources().getConfiguration().uiMode
+                & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+                == android.content.res.Configuration.UI_MODE_NIGHT_NO;
+    }
+
+    /**
+     * 读"当前该用浅色吗"：**只跟随手机系统**。
+     *
+     * <h3>为什么不再读 DSH 内定主题（改回来的原因）</h3>
+     * 之前做过一版"DSH 内定主题优先"：从页面读 {@code html[data-ds-theme-source]}
+     * 缓存下来，再用它覆盖系统 uiMode。那样虽然能让 App 外壳跟着 DSH 走，代价是
+     * **外壳与手机系统的深色开关脱钩** —— 用户在系统里切深色，外壳不动，
+     * 观感上就是"没跟随系统"。
+     *
+     * <p>用户明确要求：**保证 DSH 内的配色跟随手机系统**。所以这里退回单一口径 ——
+     * 只看系统的 {@code UI_MODE_NIGHT_YES/NO}（含"跟随日出日落"这类自动模式）。
+     * DSH 网页自身的配色由它自己的设置决定，与本 App 外壳互不干涉。
+     */
+    private boolean shouldUseLight() {
+        return systemIsLight();
+    }
+
+    /**
+     * 开屏期间的窗口外观 —— 目标是消掉用户看到的"顶部色差"。
+     *
+     * <h3>为什么不再靠"给状态栏染色"</h3>
+     * 上一版用的是 {@code setStatusBarColor(开屏底色)}。用户装上后**仍然报顶部有色差**，
+     * 说明那条路不可靠：染色可能被 ROM 覆盖，或状态栏本身还带一层半透明遮罩。
+     *
+     * 现在改成**结构上消除**：
+     * <ul>
+     *   <li>状态栏 / 导航栏设为**全透明**；</li>
+     *   <li>{@code FLAG_LAYOUT_NO_LIMITS} 让窗口内容延伸到系统栏区域。</li>
+     * </ul>
+     * 开屏 View 自己会铺满并画底色，于是系统栏那一条下面就是开屏的底色，
+     * 不再存在"两个色块相接"的可能。
+     *
+     * <p>收起开屏时由 {@link #restoreWindowChrome()} 去掉这些标志并交还系统。
+     */
+    private void applyWindowChrome() {
+        try {
+            /*
+         * 开屏配色：**跟随手机系统深色开关**（见 shouldUseLight 的说明）。
+         * 系统切深色/浅色时，onConfigurationChanged 会让开屏立刻换配色。
+         */
+            boolean lightMode = shouldUseLight();
+
+            int bg = lightMode ? SPLASH_BG_LIGHT : SPLASH_BG_DARK;
+            android.view.Window win = getWindow();
+            android.view.View decor = win.getDecorView();
+
+            win.addFlags(android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            win.setStatusBarColor(android.graphics.Color.TRANSPARENT);
+            win.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                android.view.WindowManager.LayoutParams lp = win.getAttributes();
+                lp.layoutInDisplayCutoutMode =
+                        android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                win.setAttributes(lp);
+            }
+            // 状态栏图标的明暗跟着开屏底色走（深底→浅色图标，浅底→深色图标）
+            if (lightMode) {
+                decor.setSystemUiVisibility(android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+            } else {
+                decor.setSystemUiVisibility(0);
+            }
+            android.util.Log.i("DSH_SPLASH", "窗口外观: " + (lightMode ? "浅色" : "深色")
+                    + " 开屏底色=" + Integer.toHexString(bg) + " 状态栏透明+内容延伸");
+        } catch (Throwable e) {
+            android.util.Log.w("DSH_SPLASH", "设置窗口外观失败", e);
+        }
+    }
+
+    /** 开屏收起后，把系统栏交还给系统默认表现。 */
+    private void restoreWindowChrome() {
+        try {
+            android.view.Window win = getWindow();
+            win.clearFlags(android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS);
+            win.setStatusBarColor(android.graphics.Color.TRANSPARENT);
+            win.setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+            android.util.Log.i("DSH_SPLASH", "窗口外观: 已交还系统");
+        } catch (Throwable ignore) { }
+    }
     /** dsh web 打印出来的带 token 的 URL（解析到之后 WebView 直接加载它）。 */
     private volatile String dshUrl;
     /** proot 的库搜索目录与临时目录（prepareLibs 里设置）。 */
@@ -219,13 +338,42 @@ public class MainActivity extends Activity {
         // 这是应用级窗口标志，不修改设备的任何系统设置。
         getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
+        /*
+         * 开屏期间的窗口外观 —— 目的是**消掉用户看到的"顶部色差"**。
+         *
+         * 那一条色差来自**系统状态栏**：主题是 Theme.DeviceDefault.NoActionBar，
+         * 状态栏默认是深灰，而开屏底色是 #0B0E10，两者贴着就看出明显一条。
+         *
+         * 处理办法（保守且安全）：
+         *   · 状态栏与导航栏都染成开屏底色 → 与开屏无缝；
+         *   · 顶部那条栏自身也改成开屏底色（它原本是 #1F2430，也是个色差源）；
+         *   · 不隐藏系统栏、不改成边到边布局 —— 本项目其它页面的布局依赖
+         *     "窗口不覆盖系统栏"，动那个会牵动一堆页面，收益不值这个风险。
+         * 开屏收起后由 restoreWindowChrome() 把状态栏交还给系统默认表现。
+         */
+        applyWindowChrome();
+
         // ── UI：顶部状态条（含设置按钮）+（日志 / DSH WebView）叠层 ──
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
 
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setBackgroundColor(Color.parseColor("#1F2430"));
+        /*
+         * 顶部栏底色 = 开屏底色（原来是 #1F2430，会和开屏形成一条色差）。
+         *
+         * 为什么不直接隐藏这条栏：它就叠在开屏动画上方，
+         * 而「重试」按钮在这条栏上 —— 失败时必须能看到、能点到。
+         * 所以做法是"让它和开屏同色（无缝），但保留可点"。
+         * 就绪后 onServerReady 照旧把它整体淡出。
+         */
+        /*
+         * ⚠️ 这行原来是硬编码 {@code SPLASH_BG_DARK} —— **那就是用户报的"闪光弹"根因**：
+         * 浅色主题下开屏是 0xFFEDEEEA（近白），而这条压在上面的栏是 0xFF0B0E10（近黑），
+         * 两者交界处就是一条刺眼的黑边；切主题时更会整块闪一下。
+         * 必须与开屏同色，所以这里要**按当前主题取**（DSH 内定优先）。
+         */
+        bar.setBackgroundColor(shouldUseLight() ? SPLASH_BG_LIGHT : SPLASH_BG_DARK);
         bar.setGravity(android.view.Gravity.CENTER_VERTICAL);
 
         statusBar = new TextView(this);
@@ -233,8 +381,49 @@ public class MainActivity extends Activity {
         statusBar.setPadding(32, 26, 16, 26);
         statusBar.setTextColor(Color.WHITE);
         statusBar.setText("Tdsh · 准备中…");
+        /*
+         * ★ 消除"秒数进两位数时画面抽一下"（用户报的抖动）。
+         *
+         * 根因：这条状态栏每秒被 elapsedTicker 重设一次文本，而它**没有任何宽度约束**，
+         *   且父容器是横向 LinearLayout（"设置"/"重试"按钮紧挨其后）。
+         *   于是 "9秒" → "10秒" 时文本变宽 → 父容器重新测量 → 后面的按钮整体右移，
+         *   整条栏重排一次 —— 肉眼就是"抽一下"。之后 100 秒、以及 60 秒切到"1分0秒"
+         *   还会再抽几次（fmtDuration 的输出长度是跳变的）。
+         *
+         * 修法：**先把宽度按"最长可能文本"一次性算定**，之后每秒换字都不再改变布局。
+         *   · setSingleLine + setEllipsize：保证永不换行、溢出时省略，不会因文本变化撑高；
+         *   · 布局完成后按实测文本宽度设一次固定宽度（只测一次，不进每帧路径）。
+         * 这样重排从"每秒一次"降为"零次"。
+         */
+        statusBar.setSingleLine(true);
+        statusBar.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        statusBar.setEms(17);   // 兜底宽度，先占住位置，避免首帧就被按钮挤窄
         bar.addView(statusBar, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        // 布局完成后，按最长文本量一次宽度并锁死（只做一次）
+        statusBar.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    if (statusBar == null) return;
+                    // 最长形态：两位数秒 → 三位数秒 → 分+秒，再加最长 step（18 字 + 省略号）
+                    String[] worst = {
+                        "Tdsh · 初始化中 9999秒 · 一二三四五六七八九十一二三四五六七八…",
+                    };
+                    float wmax = 0f;
+                    for (String s0 : worst) {
+                        wmax = Math.max(wmax, statusBar.getPaint().measureText(s0));
+                    }
+                    int need = (int) Math.ceil(wmax) + statusBar.getPaddingLeft()
+                            + statusBar.getPaddingRight();
+                    // 只加宽不缩窄，且给按钮留出至少 1/4 屏宽，避免把按钮挤出屏幕
+                    int cap = (int) (getResources().getDisplayMetrics().widthPixels * 0.62f);
+                    statusBar.setWidth(Math.min(need, Math.max(statusBar.getWidth(), cap)));
+                    appendReport("  [布局] 状态栏宽度已锁定为 " + statusBar.getWidth() + "px（消除秒数抖动）\n");
+                } catch (Throwable t) {
+                    android.util.Log.w("DSH_UI", "锁定状态栏宽度失败（不影响功能）", t);
+                }
+            }
+        });
 
         settingsButton = new TextView(this);
         settingsButton.setText("设置");
@@ -293,13 +482,51 @@ public class MainActivity extends Activity {
         stack.addView(scroll, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        /*
+         * 开屏动画（工业简约风，见 {@link TdshSplashView}）。
+         *
+         * 放在 stack 的**最后一个孩子** = 盖在日志与 WebView 之上，
+         * 但**不改动**原来那两个视图的可见性逻辑 —— 它只是一层"封皮"，
+         * 就绪或失败时被收起（见 {@link #dismissSplash}）。
+         *
+         * ⚠️ 为什么必须保证"一定能被收起"：它盖住的正是启动日志与「重试」按钮。
+         * 万一启动失败而它没被收起，用户会卡在一个永远转的动画上，
+         * 比看到一屏报错还糟（这正是本 App 之前踩过的"插件把界面卡住"那类问题）。
+         * 所以：失败路径、超时、以及用户点击，三条路都能收掉它。
+         */
+        splash = new TdshSplashView(this);
+        splash.setOnClickListener(v -> dismissSplash());   // 点一下就能看日志
+        /*
+         * 把主题告诉开屏（它自己只能读到系统 uiMode，而 DSH 的内定主题可能与系统相反）。
+         * 这里的 lightMode 已经是"DSH 内定优先、系统次之"算出来的值。
+         */
+        splash.setLightTheme(shouldUseLight());
+        /*
+         * 开屏上那个"设置按钮"已按用户要求去掉，所以这里不再绑定它的动作。
+         * 设置入口仍在右上角「设置」，以及 DSH 设置页里的「API Key（本机）」。
+         */
+        stack.addView(splash, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        splashShownAt = SystemClock.uptimeMillis();
+
+        /*
+         * 开屏期间**把顶部那条状态栏藏掉**（用户要求"去掉上面那一栏"）。
+         *
+         * 注意这里只改 alpha 不改 GONE：因为「重试」按钮就在这条栏上，
+         * 万一启动失败，dismissSplash() 会把它恢复出来（见 restoreTopBarForSplash）。
+         * 直接 GONE 会让失败时连重试都点不到 —— 那才是真的把人卡住。
+         */
+        if (topBar != null) {
+            topBar.animate().cancel();
+            topBar.setVisibility(View.VISIBLE);
+            topBar.animate().alpha(0f).setDuration(260).start();
+        }
+
         // DSH 的 Web UI 最终显示在这里。
         // proot 不隔离网络，所以容器里的 127.0.0.1:3080 就是手机的回环地址。
         // 仅调试构建开启 WebView 远程调试（供 PC 侧用 Chrome DevTools 协议检查/试验样式）
-        if ((getApplicationInfo().flags
-                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
-            WebView.setWebContentsDebuggingEnabled(true);
-        }
+        if (isDebuggable()) {
+            WebView.setWebContentsDebuggingEnabled(true);        }
         webView = new WebView(this);
         // 窄屏适配补丁：DSH 的设置弹窗原本是「左分类 188px + 右内容 124px」，
         // 在手机上会把中文挤成一字一行。补丁把它改成整屏的「列表 → 详情」两态。
@@ -658,6 +885,30 @@ public class MainActivity extends Activity {
 
         setContentView(root);
 
+        /*
+         * 【系统栏：为什么这里**不做**任何内边距处理（2026-10-05 实测后撤掉）】
+         *
+         * 一度以为"平板/横屏下内容会被系统栏压住"，于是加过两版代码：
+         *   ① setOnApplyWindowInsetsListener + requestApplyInsets() —— 真机上监听器
+         *      **一次都没被回调**（同一时刻 onConfigurationChanged 是正常触发的，
+         *      所以不是日志/生命周期问题）；
+         *   ② 改读系统尺寸资源 status_bar_height / navigation_bar_height ——
+         *      getIdentifier 取不到（返回 0），而且没有明显收益。
+         *
+         * 撤回的真正理由是**实测事实**：`dumpsys window` 里我们的窗口是
+         * `Frames: frame=[0,0][1080,2376]`（与屏幕同尺寸），而截图（_archive\release-033.png）
+         * 显示状态栏与手势条都正常显示、界面内容完整。也就是说
+         * **系统在 targetSdk 28 下已经把内容区排好了，不需要我们再加内边距**。
+         *
+         * 按项目规矩："没验证的推断不加进代码"——加一层算不准的 padding
+         * 反而可能把本来正常的内容挤出去（那才是"修出新 bug"）。
+         * 下面这条结论要留着，免得下次再走一遍：
+         *   · 本项目**刻意不隐藏系统栏**（没有 SYSTEM_UI_FLAG_FULLSCREEN 一类调用）——
+         *     用户要能随时用系统的返回/主页/任务键；
+         *   · 真要处理刘海/挖孔，得用 displayCutout 且**必须先在目标机上验证**
+         *     （本机 cutout 在顶部中间 Rect(510,0-570,90)），不要凭形状猜。
+         */
+
         StringBuilder head = new StringBuilder();
         head.append("Tdsh — 容器自检\n");
         head.append("──────────────────────────\n");
@@ -679,6 +930,7 @@ public class MainActivity extends Activity {
         askRegionIfNeeded("首次启动");
         mark("onCreate 结束（界面已可见）");
     }
+
 
     /**
      * 首次启动时问一次"你在哪个地区"，用来**选对安装源**。
@@ -879,6 +1131,47 @@ public class MainActivity extends Activity {
             return;
         }
         probeBlank();
+    }
+
+    /**
+     * 屏幕方向 / 尺寸变化时**不重建 Activity**（配合清单里的 {@code configChanges}）。
+     *
+     * <h3>为什么必须接管</h3>
+     * 原来清单里 MainActivity **没有声明 configChanges**，于是屏幕方向一变，
+     * 系统就销毁并重建这个 Activity —— WebView 跟着重载，用户看到的就是
+     * **"界面自己重启了"**（调研报告里有 logcat 硬证据：`changed=0x80 CONFIG_ORIENTATION`、
+     * 1.2 秒内 land→port 翻了两次 = 重建两次）。这条对**平板**和横竖屏切换尤其重要。
+     *
+     * <h3>为什么不能只声明 configChanges 就完事</h3>
+     * 声明之后系统不再帮忙重建，**布局得自己跟上**：WebView 的宽度虽然会跟着
+     * Activity 的窗口变化，但 DSH 前端是靠 {@code window.innerWidth} 决定
+     * "手机窄屏 / 平板宽屏"那两套布局的，它需要一次 resize 事件才会重算。
+     * 所以我们在这里补一次 resize 通知，并重跑一遍窄屏补丁
+     * （补丁的 {@code apply()} 内部就是按宽度分流的，重跑是幂等的）。
+     */
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        appendReport("  · 屏幕配置变化（orientation=" + newConfig.orientation
+                + "，宽度 " + newConfig.screenWidthDp + "dp）—— 不重建界面，只通知页面重排\n");
+        // 等一帧让 WebView 拿到新宽度，再通知页面；重试一次兜住"这一帧还没量好"
+        if (webView == null) return;
+        webView.postDelayed(() -> reflowPage(), 120);
+        webView.postDelayed(() -> reflowPage(), 500);
+    }
+
+    /**
+     * 让 DSH 页面按当前宽度重排一遍（幂等，不会改任何数据）。
+     */
+    private void reflowPage() {
+        if (webView == null) return;
+        try {
+            webView.evaluateJavascript(
+                    "(function(){try{"
+                  + "window.dispatchEvent(new Event('resize'));"
+                  + "if(typeof window.__dshMobilePatch==='function')window.__dshMobilePatch();"
+                  + "return 1;}catch(e){return 0;}})()", null);
+        } catch (Throwable ignore) { }
     }
 
     /** 量一下页面正文有多长；连续几次都是空的就认为白屏了。 */
@@ -1736,6 +2029,16 @@ public class MainActivity extends Activity {
             mark("走快速路径：跳过 11 项探针");
             appendReport("  容器已就绪，且自检标记有效 → 跳过 11 项探针，直接启动 dsh web\n");
             Log.i(TAG, "fast start: 跳过自检");
+            /*
+             * ★ 快速路径也必须上报进度（踩过的坑）。
+             *
+             * 进度点原来只加在"完整自检链"里，而这台机器早就通过自检、每次都走快速路径，
+             * 于是进度永远是 0 —— 开屏动画（帧号由进度算出）**一直停在第一帧**，
+             * 用户看到的就是"画面卡住不动"。
+             *
+             * 这里按快速路径的真实节奏补几个点：容器已就绪 → 起服务 → 等 web → 就绪。
+             */
+            splashProgress(0.35f);
             StringBuilder fast = new StringBuilder();
             fast.append("快速启动（容器已就绪，跳过自检）\n");
             fast.append(startWebAndWait());
@@ -1798,25 +2101,32 @@ public class MainActivity extends Activity {
             return;
         }
         r.append("TEST 8 · Phase 1b：容器内安装 Node.js\n");
+        splashProgress(0.45f);          // 容器已解包完成，进入装 Node
         String t8 = testNode(base, rootfs, libDir, new StringBuilder()); r.append(t8).append('\n');
         appendReport("TEST 8 · 容器内安装 Node.js\n" + t8 + "\n");
+        splashProgress(0.58f);
 
         r.append("TEST 9 · Phase 1b：容器内安装并运行 DSH\n");
+        splashProgress(0.62f);          // 装 DSH 是最慢的一段（npm install 可能十几分钟）
         String t9 = testDsh(base, rootfs, libDir, new StringBuilder()); r.append(t9).append('\n');
         appendReport("TEST 9 · 容器内安装 DSH\n" + t9 + "\n");
+        splashProgress(0.86f);          // DSH 装完
 
         // ── 手机存储访问（容器能否看到手机文件）──
         r.append("TEST 10 · 手机存储访问\n");
         String t11 = testStorage(base, libDir); r.append(t11).append('\n');
         appendReport("TEST 10 · 手机存储访问\n" + t11 + "\n");
+        splashProgress(0.90f);
 
         // ── 硬链接支持（DSH 会话日志依赖）──
         r.append("TEST 11 · 硬链接支持\n");
         String t12 = testHardLink(base, libDir); r.append(t12).append('\n');
         appendReport("TEST 11 · 硬链接支持\n" + t12 + "\n");
+        splashProgress(0.93f);
 
         // ── Phase 2：交给前台服务常驻运行，并等待 Web UI 就绪 ──
         r.append("Phase 2 · 启动前台服务并等待 dsh web\n");
+        splashProgress(0.96f);          // 开始起服务，最后 4% 留给"等待 web 就绪"
         r.append(startWebAndWait());
         // 自检全过 → 记下标记，下次启动直接走快速路径
         markVerified();
@@ -2595,6 +2905,26 @@ public class MainActivity extends Activity {
         liveProgress(line);
     }
 
+    /*
+     * ── 把真实初始化进度喂给开屏动画 ───────────────────────────────
+     *
+     * 为什么需要：开屏动画现在是成片帧序列（216 帧），如果按时间自走，
+     * 就会出现"加载早就完了动画还在转"或"加载卡住动画已经播完"——两边对不上。
+     * 用户明确要求动画与加载进度适配，所以这里把每个阶段完成时把进度报过去，
+     * 帧号直接由进度算出（见 TdshSplashView.currentFrameIndex）。
+     *
+     * 取值按各阶段大致耗时占比给（容器解包最慢、起服务最快），
+     * 只求单调递增、跟得上真实节奏，不追求精确到秒。
+     */
+    private void splashProgress(float p) {
+        final TdshSplashView v = splash;
+        if (v == null) return;
+        runOnUiThread(() -> {
+            final TdshSplashView vv = splash;
+            if (vv != null) vv.setProgress(p);
+        });
+    }
+
     // ── TEST 8 / TEST 9 · Phase 1b：Node + DSH ─────────────────
     //
     // 包级可见（去掉 private）是给 {@link Region} 用的：Node 的下载源要按地区排序。
@@ -2923,21 +3253,134 @@ public class MainActivity extends Activity {
     // "插件面板把界面顶掉"事故的根源 —— 现在统一由 UrlPick 负责（只认带 token 的
     // DSH 地址），所以把这个死方法删掉，免得以后有人又把它捡回去用。
 
+    /**
+     * 显示「已就绪」之后、开始收尾之前的停顿。
+     *
+     * <p>为什么要专门停这一下（用户要求）：原来是在 {@link #onServerReady} 里
+     * 直接让 WebView 变可见 + 载入页面，然后才想起播收尾 —— 页面一瞬间就盖在
+     * 开屏上面，**收尾那段倒放（直角→矩形→空心线→点）根本来不及被看见**。
+     * 现在：先让读数停在「已就绪 100%」半秒，再播收尾，收尾播完才把页面交出来。
+     */
+    private static final long READY_HOLD_MS = 500L;
+
     private void onServerReady(String url) {
         runOnUiThread(() -> {
             statusBar.setText("DSH 运行中 · 127.0.0.1:" + Env.DSH_PORT);
             output.setVisibility(View.GONE);
-            webView.setVisibility(View.VISIBLE);
-            webView.loadUrl(url);
-            // 就绪后把整条状态栏收起 —— 它常年挡在最上方影响视野。
-            // 之后进入本 App 设置的入口改到 DSH 设置页里的「API Key（本机）」。
-            if (topBar != null) {
-                topBar.animate().alpha(0f).setDuration(300).withEndAction(() -> {
-                    if (topBar != null) topBar.setVisibility(View.GONE);
-                }).start();
+            /*
+             * ★ 这里**先不显示 WebView、也先不 loadUrl**。
+             *
+             * 踩过的坑：原来一上来就 `webView.setVisibility(VISIBLE) + loadUrl(url)`，
+             * 页面立刻盖住开屏 —— 收尾倒放虽然代码在跑（日志里 t 确实从 1.65 退回 0），
+             * 但**肉眼完全看不到**，用户反馈"根本就没有发生这个过程"。
+             * 现在把"交棒"推迟到收尾播完之后，收尾才是真的看得见。
+             */
+            final TdshSplashView v = splash;
+            final Runnable handOver = () -> {
+                webView.setVisibility(View.VISIBLE);
+                webView.loadUrl(url);
+                appendReport("  WebView 加载: " + url + "\n");
+            };
+
+            if (v == null) {
+                handOver.run();
+                restoreWindowChrome();
+                hideTopBar();
+                return;
             }
+
+            v.setProgress(1f);                    // 读数补满：已就绪 / 100.0%
+            final boolean[] done = {false};
+            final Runnable finish = () -> {
+                if (done[0]) return;
+                done[0] = true;
+                // 顺序要紧：先让页面可见，再收开屏。
+                // dismissSplash() 会按"webView 是否可见"决定要不要把顶部状态栏亮出来；
+                // 若反过来，它会以为"不是正常就绪"而把那条栏亮回来，闪一下。
+                handOver.run();
+                dismissSplash();
+            };
+
+            // 让"已就绪"先停一下，再开始倒放
+            final long shown = SystemClock.uptimeMillis() - splashShownAt;
+            final long wait = Math.max(READY_HOLD_MS, SPLASH_MIN_MS - shown);
+            v.postDelayed(() -> v.collapse(finish), wait);
+            v.postDelayed(finish, wait + 2600);   // 兜底：收尾回调没来也强制交棒
+
+            restoreWindowChrome();   // 开屏收起，系统栏交还系统
+            hideTopBar();
         });
-        appendReport("  WebView 加载: " + url + "\n");
+    }
+
+    /** 就绪后把整条状态栏收起 —— 它常年挡在最上方影响视野。 */
+    private void hideTopBar() {
+        if (topBar != null) {
+            topBar.animate().alpha(0f).setDuration(300).withEndAction(() -> {
+                if (topBar != null) topBar.setVisibility(View.GONE);
+            }).start();
+        }
+    }
+
+    /**
+     * 收起开屏动画（淡出）。**幂等**，可以从任何路径调用。
+     *
+     * <h3>为什么"一定能被收起"是硬要求</h3>
+     * 这块动画盖住的正是启动日志与「重试」按钮。如果启动失败而它没收起，
+     * 用户就卡在一个永远在转的开屏上 —— 比看到一屏报错还糟。
+     * 所以它至少有四条退路：
+     * <ol>
+     *   <li>服务就绪（{@link #onServerReady}）；</li>
+     *   <li>启动失败 / 亮出日志面板时（见 onPluginBootFailed 等处）；</li>
+     *   <li>用户**点一下**屏幕（本类构造函数里注册的点击）；</li>
+     *   <li>兜底超时：即便上面都没发生，{@link #SPLASH_MAX_MS} 之后自动收起。</li>
+     * </ol>
+     */
+    private void dismissSplash() {
+        if (splash == null) return;
+        final TdshSplashView v = splash;
+        splash = null;                       // 先置空 → 幂等（重复调用直接返回）
+        // 显式停掉 60fps 心跳：视图可能还没 detached，光靠 onDetachedFromWindow 不够及时
+        try { v.stopAnimating(); } catch (Throwable ignore) { }
+        /*
+         * 开屏期间顶部状态栏是被我们藏起来的（用户要求去掉那条栏）。
+         * 现在要收起开屏了，如果**不是**因为"服务已就绪"（那种情况下
+         * onServerReady 自己会把整条栏收掉），就必须把它恢复出来 ——
+         * 因为「重试」按钮在这条栏上，失败时用户得能点到。
+         */
+        if (webView == null || webView.getVisibility() != View.VISIBLE) {
+            restoreWindowChrome();
+            if (topBar != null) {
+                topBar.animate().cancel();
+                topBar.setVisibility(View.VISIBLE);
+                topBar.animate().alpha(1f).setDuration(200).start();
+            }
+        }
+        long shown = SystemClock.uptimeMillis() - splashShownAt;
+        long wait = Math.max(0L, SPLASH_MIN_MS - shown);
+        Runnable hide = () -> {
+            try {
+                v.animate().alpha(0f).setDuration(260).withEndAction(() -> {
+                    try {
+                        v.setVisibility(View.GONE);
+                        ViewGroup gp = (ViewGroup) v.getParent();
+                        if (gp != null) gp.removeView(v);
+                    } catch (Throwable ignore) { }
+                }).start();
+            } catch (Throwable t) {
+                try { v.setVisibility(View.GONE); } catch (Throwable ignore) { }
+            }
+        };
+        // 启动很快时也别"闪一下"：先保证露脸到最短时长
+        if (wait > 0) uiHandler.postDelayed(hide, wait); else runOnUiThread(hide);
+        // 兜底：无论动画/回调出什么岔子，超过上限一定移除
+        uiHandler.postDelayed(this::forceRemoveSplash, SPLASH_MAX_MS);
+    }
+
+    /** 兜底移除（不依赖任何动画回调）。 */
+    private void forceRemoveSplash() {
+        try {
+            if (splash != null) { splash.setVisibility(View.GONE); splash = null; }
+        } catch (Throwable ignore) { }
     }
 
     // ── 插件把前端卡死时的自救（配合 patch.js 的 bootWatchdog）──────────
@@ -2955,7 +3398,7 @@ public class MainActivity extends Activity {
      * 用户会看到界面一直闪、插件一个个消失。超过上限就停止自动动手，
      * 改成亮面板把决定权交回用户，并提示发日志。
      */
-    private static final int AUTO_FIX_MAX = 2;
+    private static final int AUTO_FIX_MAX = 3;
 
     /**
      * 用户点过「显示界面」之后，本次运行不再对前端自检做任何自动动作。
@@ -3006,10 +3449,19 @@ public class MainActivity extends Activity {
     }
 
     /** profile 里**不是**官方/自带的那些（也就是用户自己装的第三方插件）。 */
+    /**
+     * 该被停用的第三方插件 —— **从磁盘上发现，而不是只看 profile.bundles**。
+     *
+     * <p>为什么改（真机事故）：肇事插件 `dsh-agnes-multimodal-fixed` 不在 bundles 里，
+     * 于是"候选为空 → 停用 0 个 → 撞上自动自救上限 → 放弃"，
+     * 用户就一直卡在"Failed to load plugins"那屏出不来。
+     * 现在交给 {@link Env#discoverThirdParty} 把 bundles / cordis.patch.yml /
+     * node_modules 三处一起扫，并排除官方包与自带插件。
+     */
     private List<String> thirdPartyBundles() {
         List<String> out = new java.util.ArrayList<>();
         try {
-            for (String b : Env.profileBundles(this)) {
+            for (String b : Env.discoverThirdParty(this)) {
                 if (!isProtectedBundle(b)) out.add(b);
             }
         } catch (Throwable ignore) { }
@@ -3180,7 +3632,7 @@ public class MainActivity extends Activity {
                         android.widget.Toast.LENGTH_LONG).show();
                 output.append("  🛠 自动自救：已停用 " + stopped + " 个插件 → "
                         + join(Env.disabledBundles(this))
-                        + "\n     恢复入口：设置 → 手机权限 → 插件安全模式\n");
+                        + "\n     恢复入口：设置 → 手机权限 → 插件安全模式（可一键恢复被停的插件）\n");
             });
             restartDshAndWait();
             return;
@@ -3194,6 +3646,8 @@ public class MainActivity extends Activity {
                 topBar.setVisibility(View.VISIBLE);
             }
             if (retryButton != null) retryButton.setVisibility(View.VISIBLE);
+            // 必须收起开屏动画：它盖住的正是这块日志与「重试」
+            dismissSplash();
             output.setVisibility(View.VISIBLE);
             webView.setVisibility(View.GONE);
 
@@ -3434,6 +3888,8 @@ public class MainActivity extends Activity {
                 topBar.setVisibility(View.VISIBLE);
             }
             if (retryButton != null) retryButton.setVisibility(View.VISIBLE);
+            // 必须收起开屏动画：它盖住的正是这块日志与「重试」
+            dismissSplash();
             output.setVisibility(View.VISIBLE);
             webView.setVisibility(View.GONE);
 
@@ -3524,8 +3980,19 @@ public class MainActivity extends Activity {
     }
 
     /** 暴露给注入脚本的极小桥：只提供"打开本 App 页面"的能力。 */
-    private class AppBridge {
-        @android.webkit.JavascriptInterface
+    /**
+     * 当前是不是**调试构建**。
+     *
+     * <p>用途：所有"只在开发期有效"的钩子都靠它把关（WebView 远程调试、
+     * 悬浮窗调试入口……）。正式包里这些路径一律不可达 ——
+     * 用户装的是 release，不该多出任何可被第三方网页调用的能力。
+     */
+    private boolean isDebuggable() {
+        return (getApplicationInfo().flags
+                & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+    }
+
+    private class AppBridge {        @android.webkit.JavascriptInterface
         public void openAppSettings() {
             runOnUiThread(MainActivity.this::showSettingsDialog);
         }
@@ -3576,6 +4043,44 @@ public class MainActivity extends Activity {
                     Log.e(TAG, "打开手机权限页失败", t);
                 }
             });
+        }
+
+        /**
+         * 【仅调试构建有效】直接开关悬浮窗，返回一句人话给页面。
+         *
+         * <p>为什么需要它：悬浮球那套入口是 {@code exported=false} 的（安全），
+         * 所以 adb 那句 {@code am start-foreground-service} 会被系统拒绝
+         * （实测 "Requires permission not exported from uid"）—— 开发期想验证浮层，
+         * 只能从 App 内部触发。这个钩子就是那条内部路径：正式包里它什么都不做。
+         *
+         * <p>用法（真机 CDP）：
+         * <pre>node tools\cdp.mjs "DshAndroid.debugOverlay('')"</pre>
+         * 参数传 {@code 'hide'} 表示收起；其它值一律当"打开"。
+         *
+         * <p>这条**不碰任何数据**，只调 BallWindow 的静态入口，
+         * 所以风险等价于点界面上的那个按钮。
+         */
+        @android.webkit.JavascriptInterface
+        public String debugOverlay(String op) {
+            if (!isDebuggable()) return "（正式包不提供这个接口）";
+            final boolean hide = op != null && op.trim().equals("hide");
+            try {
+                if (hide) BallWindow.hide(MainActivity.this);
+                else BallWindow.show(MainActivity.this);
+                return hide ? "已请求收起悬浮窗" : "已请求打开悬浮窗"
+                        + (BallWindow.canDraw(MainActivity.this) ? "" : "（但没有悬浮窗权限！）");
+            } catch (Throwable t) {
+                return "调用失败：" + t;
+            }
+        }
+
+        /** 悬浮窗当前状态（调试用）。 */
+        @android.webkit.JavascriptInterface
+        public String debugOverlayState() {
+            if (!isDebuggable()) return "（正式包不提供这个接口）";
+            return "shown=" + BallWindow.isShown()
+                    + " canDraw=" + BallWindow.canDraw(MainActivity.this)
+                    + " dshUrl=" + (DshService.getUrl() == null ? "(还没就绪)" : "ok");
         }
 
         /**
@@ -3636,42 +4141,6 @@ public class MainActivity extends Activity {
                 }
                 // 界面确实出来了，才是"这一版改了什么"该现身的时候
                 maybeShowChangelog();
-            });
-        }
-
-        /** 用途守卫：页面侧要用的关键词清单（本地判断，不上传任何内容）。 */
-        @android.webkit.JavascriptInterface
-        public String guardPatterns() {
-            try { return Guard.patternsJson(); } catch (Throwable t) { return "[]"; }
-        }
-
-        /**
-         * 页面在对话里扫到疑似违规用途 → 弹一次警告。
-         *
-         * <p>只在本地判断：命中的词与说明写进运行日志，**不联网、不上报**。
-         * 12 小时内只弹一次（见 {@link Guard#shouldShow}），避免每轮都糊一脸。
-         */
-        @android.webkit.JavascriptInterface
-        public void misuseDetected(final String hit, final String what) {
-            runOnUiThread(() -> {
-                Env.report(MainActivity.this, "  [守卫] 对话里出现疑似违规用途的关键词："
-                        + hit + "（" + what + "）\n");
-                if (!Guard.shouldShow(MainActivity.this)) return;
-                Guard.markShown(MainActivity.this);
-                try {
-                    new AlertDialog.Builder(MainActivity.this)
-                            .setTitle("请不要用 Tdsh 做违法的事")
-                            .setMessage(Guard.warningText(hit, what))
-                            .setPositiveButton("我知道了", null)
-                            .setNeutralButton("看免责声明", (d, w) -> {
-                                try {
-                                    startActivity(new Intent(MainActivity.this, PhonePermActivity.class));
-                                } catch (Throwable ignore) { }
-                            })
-                            .show();
-                } catch (Throwable t) {
-                    Log.w(TAG, "守卫弹窗失败", t);
-                }
             });
         }
 
@@ -3813,6 +4282,28 @@ public class MainActivity extends Activity {
         }
 
 
+        // ── 删除历史对话（含归档）────────────────────────────────
+        /*
+         * 用户要求：范围包含**已归档**会话，是彻底清除而不是归档；
+         * 操作前二次确认；完成后刷新列表并反馈结果。
+         *
+         * 磁盘位置（容器内 HOME=/root，见 Env）：
+         *   <base>/rootfs/root/.dsh/sessions/            活跃会话
+         *   <base>/rootfs/root/.dsh/dsh-session-archive/ 已归档会话
+         * 两处都删，才叫"含归档的彻底清除"。
+         */
+        TextView delBtn = new TextView(this);
+        delBtn.setText("🗑 删除历史对话（含已归档）");
+        delBtn.setTextSize(13f);
+        delBtn.setTextColor(Color.parseColor("#FF8A80"));
+        delBtn.setPadding(pad / 2, pad / 2, pad / 2, pad / 2);
+        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dlp.topMargin = pad / 2;
+        dlp.bottomMargin = pad / 4;
+        box.addView(delBtn, dlp);
+        delBtn.setOnClickListener(v -> confirmWipeSessions());
+
         final EditText input = new EditText(this);
         input.setHint("sk-...");
         input.setTextSize(14f);
@@ -3850,6 +4341,95 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             android.widget.Toast.makeText(this, "复制失败: " + t.getMessage(),
                     android.widget.Toast.LENGTH_LONG).show();
+        }
+    }
+
+    // ── 删除历史对话（含已归档）─────────────────────────────────
+
+    /** 活跃会话目录。 */
+    private File sessionsDir() {
+        return new File(Env.base(this), "rootfs/root/.dsh/sessions");
+    }
+
+    /** 已归档会话目录 —— 删除范围必须包含它（用户明确要求"含归档"）。 */
+    private File sessionArchiveDir() {
+        return new File(Env.base(this), "rootfs/root/.dsh/dsh-session-archive");
+    }
+
+    /**
+     * 第二次确认。用户要求"操作前需二次确认"——因为这是**彻底清除、不可恢复**，
+     * 不是归档，误点代价很大（会话记录只有这一份）。
+     */
+    private void confirmWipeSessions() {
+        int n = countSessions();
+        new AlertDialog.Builder(this)
+                .setTitle("删除全部历史对话？")
+                .setMessage("将**彻底删除**容器内的会话记录，包含已归档的会话。\n\n"
+                        + "当前检测到 " + n + " 个会话目录。\n\n"
+                        + "· 此操作不可撤销、无法恢复；\n"
+                        + "· API Key、插件、白名单等设置不受影响；\n"
+                        + "· 正在进行的对话会被清掉，请先结束对话。\n\n确认要删除吗？")
+                .setPositiveButton("确认删除", (d, w) -> wipeSessions())
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    /** 统计会话目录数（只用于提示，失败时返回 -1 表示读不到）。 */
+    private int countSessions() {
+        try {
+            int n = 0;
+            File[] a = sessionsDir().listFiles();
+            if (a != null) n += a.length;
+            File[] b = sessionArchiveDir().listFiles();
+            if (b != null) n += b.length;
+            return n;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * 执行删除。放在后台线程：目录里可能有很多会话文件，主线程删会卡动画。
+     * 完成后回主线程刷新列表并把结果反馈给用户（Toast + 顶部状态栏 + 报告）。
+     *
+     * 真正的文件操作走 {@link Wipe}（纯逻辑类），这样能离线跑真目录回归 ——
+     * release 包在真机上没法用 run-as 验证（package not debuggable）。
+     */
+    private void wipeSessions() {
+        final String[] res = new String[1];
+        appendReport("  [删除] 开始删除历史对话（含归档）\n");
+        new Thread(() -> {
+            try {
+                Wipe.Result r = Wipe.wipe(sessionsDir(), sessionArchiveDir());
+                res[0] = "已删除 " + r.toString();
+            } catch (Throwable t) {
+                res[0] = "删除失败：" + t;
+                android.util.Log.w("DSH_UI", "删除历史对话失败", t);
+            }
+            runOnUiThread(() -> {
+                appendReport("  [删除] " + res[0] + "\n");
+                if (statusBar != null) statusBar.setText("Tdsh · " + res[0]);
+                android.widget.Toast.makeText(this, res[0], android.widget.Toast.LENGTH_LONG).show();
+                // 刷新列表：重载页面，让 DSH 重新读取（此时会话目录已空）
+                refreshConversationList();
+            });
+        }, "dsh-wipe-sessions").start();
+    }
+
+    /**
+     * 刷新会话列表。
+     *
+     * 直接 reload 最稳：会话列表是 DSH 前端在加载时读的，
+     * 不重载的话界面还显示已经删掉的条目（用户会以为没生效）。
+     */
+    private void refreshConversationList() {
+        try {
+            if (webView != null) {
+                webView.reload();
+                appendReport("  [删除] 已重载页面以刷新会话列表\n");
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("DSH_UI", "刷新会话列表失败", t);
         }
     }
 
@@ -3938,6 +4518,16 @@ public class MainActivity extends Activity {
                       + "   · 请到系统设置里允许本应用「自启动 / 后台运行」后点「重试」"));
                 return;
             }
+            /*
+             * ★ 每一圈都要上报进度（不能只在 i%5==4 时上报）。
+             *
+             * 踩过的坑：进度原来放在 `if (i % 5 == 4)` 里 —— 也就是**每 5 秒才更新一次**。
+             * 帧号由进度算出，于是画面每 5 秒才跳一格，中间几秒完全静止，用户看到的就是
+             * 「动画完全卡住了」（真机日志确认：帧号连续 3~4 秒不变）。
+             * 现在每圈（1 秒）都报，并且把总跨度按最坏等待时间（240 秒）来分配，
+             * 让它**平滑推进**而不是几步跳完。
+             */
+            splashProgress(0.35f + 0.64f * Math.min(1f, (i + 1) / 240f));
             if (i % 5 == 4) {
                 final String st = DshService.getState();
                 final long el = System.currentTimeMillis() - t0;
